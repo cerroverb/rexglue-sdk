@@ -58,6 +58,7 @@ class WindowSDL final : public Window {
   void ApplyNewMouseCapture() override;
   void ApplyNewMouseRelease() override;
   void ApplyNewCursorVisibility(CursorVisibility old_cursor_visibility) override;
+  void ApplyNewTextInputActive() override;
   void FocusImpl() override;
   void ApplyWindowedClientSizeImpl(uint32_t width, uint32_t height) override;
 
@@ -78,6 +79,7 @@ class WindowSDL final : public Window {
   void ApplyCursorVisibilityNow();
   // Resizes the client area to width x height physical pixels (SDL sizes are in points).
   void ResizeWindowedClientNow(uint32_t width, uint32_t height, const char* reason);
+  void ApplyTextInputActiveNow();
   void RearmCursorAutoHideTimer();
 
   SDL_Window* sdl_window_ = nullptr;
