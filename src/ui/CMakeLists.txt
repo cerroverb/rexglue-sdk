@@ -65,10 +65,9 @@ if(WIN32)
         windowed_app_context_win.cpp
     )
 else()
+    # The window is SDL's (window_sdl.cpp, windowed_app_context_sdl.cpp)
     set(REXUI_PLATFORM_SOURCES
         surface_gnulinux.cpp
-        window_gtk.cpp
-        windowed_app_context_gtk.cpp
     )
 endif()
 
@@ -143,21 +142,16 @@ if(WIN32)
     )
 else()
     find_package(PkgConfig REQUIRED)
-    pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
     pkg_check_modules(X11_XCB REQUIRED x11-xcb)
     # Required, not optional: vulkan/api.h pulls in <wayland-client.h> on every
     # Linux build.
     pkg_check_modules(WAYLAND REQUIRED wayland-client)
 
-    target_include_directories(rexui PRIVATE
-        ${GTK3_INCLUDE_DIRS}
-    )
     target_include_directories(rexui PUBLIC
         ${X11_XCB_INCLUDE_DIRS}
         ${WAYLAND_INCLUDE_DIRS}
     )
     target_link_libraries(rexui PUBLIC
-        ${GTK3_LIBRARIES}
         ${X11_XCB_LIBRARIES}
         ${WAYLAND_LIBRARIES}
     )
