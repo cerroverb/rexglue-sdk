@@ -108,9 +108,12 @@ void ImGuiDrawer::Initialize() {
 
   auto& io = ImGui::GetIO();
 
+#if !REX_PLATFORM_WIN32
+  // The SDL window's text input follows ImGui's focus; the Win32 window keeps ImGui's own IME handler.
   auto& platform_io = ImGui::GetPlatformIO();
   platform_io.Platform_SetImeDataFn = PlatformSetImeData;
   platform_io.Platform_ImeUserData = this;
+#endif
 
   // TODO(gibbed): disable imgui.ini saving for now,
   // imgui assumes paths are char* so we can't throw a good path at it on
