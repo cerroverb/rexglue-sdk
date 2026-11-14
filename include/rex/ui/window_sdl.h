@@ -32,6 +32,8 @@ class WindowSDL final : public Window {
   ~WindowSDL() override;
 
   void* GetNativeWindowHandle() const override;
+  // The SDL window, for a port's own SDL calls (dialogs owned by the game window, the display it is on).
+  SDL_Window* sdl_window() const { return sdl_window_; }
 
   // Called by SDLWindowedAppContext on the UI thread.
   void HandleWindowEvent(SDL_Event& event);
