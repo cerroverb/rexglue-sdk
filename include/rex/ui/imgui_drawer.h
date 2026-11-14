@@ -28,6 +28,8 @@ struct ImDrawData;
 struct ImFontAtlas;
 struct ImGuiContext;
 struct ImGuiIO;
+struct ImGuiPlatformImeData;
+struct ImGuiViewport;
 enum ImGuiKey : int;
 
 namespace rex {
