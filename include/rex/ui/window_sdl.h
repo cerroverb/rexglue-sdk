@@ -13,6 +13,9 @@
 
 #pragma once
 
+#include <utility>
+#include <vector>
+
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -32,6 +35,7 @@ class WindowSDL final : public Window {
   ~WindowSDL() override;
 
   void* GetNativeWindowHandle() const override;
+  std::vector<std::pair<uint32_t, uint32_t>> ListWindowedClientSizes() const override;
   // The SDL window, for a port's own SDL calls (dialogs owned by the game window, the display it is on).
   SDL_Window* sdl_window() const { return sdl_window_; }
 
@@ -55,6 +59,7 @@ class WindowSDL final : public Window {
   void ApplyNewMouseRelease() override;
   void ApplyNewCursorVisibility(CursorVisibility old_cursor_visibility) override;
   void FocusImpl() override;
+  void ApplyWindowedClientSizeImpl(uint32_t width, uint32_t height) override;
 
   std::unique_ptr<Surface> CreateSurfaceImpl(Surface::TypeFlags allowed_types) override;
   void RequestPaintImpl() override;
@@ -71,10 +76,14 @@ class WindowSDL final : public Window {
   void DestroySDLWindow();
 
   void ApplyCursorVisibilityNow();
+  // Resizes the client area to width x height physical pixels (SDL sizes are in points).
+  void ResizeWindowedClientNow(uint32_t width, uint32_t height, const char* reason);
   void RearmCursorAutoHideTimer();
 
   SDL_Window* sdl_window_ = nullptr;
   SDL_WindowID sdl_window_id_ = 0;
+  // A windowed client size asked for while fullscreen (SDL_SetWindowSize has no effect then): applied on leaving it.
+  uint32_t pending_client_width_ = 0, pending_client_height_ = 0;
   std::atomic<bool> paint_pending_{false};
   // Auto-hide cursor bookkeeping (CursorVisibility::kAutoHidden).
   SDL_TimerID cursor_hide_timer_ = 0;

@@ -25,6 +25,7 @@
 #include <rex/graphics/video_mode_util.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#include <rex/ui/display_mode.h>
 #include <rex/ui/flags.h>
 #include <rex/ui/sdl_virtual_key.h>
 
@@ -147,6 +148,17 @@ bool WindowSDL::OpenImpl() {
   sdl_window_id_ = SDL_GetWindowID(sdl_window_);
   sdl_app_context().RegisterWindow(sdl_window_id_, this);
 
+  // window_client_size: the windowed client size, only when set, before entering fullscreen (as window_win.cpp).
+  {
+    const std::string& client_size = REXCVAR_GET(window_client_size);
+    uint32_t client_width, client_height;
+    if (display_mode::ParseSizeText(client_size, client_width, client_height)) {
+      ResizeWindowedClientNow(client_width, client_height, "window_client_size at start-up");
+    } else if (!client_size.empty()) {
+      REXLOG_WARN("WindowSDL: window_client_size '{}' is not WxH (e.g. 1600x900): ignored", client_size);
+    }
+  }
+
   if (IsFullscreen()) {
     // Borderless desktop fullscreen (a NULL display mode is SDL3's default).
     SDL_SetWindowFullscreen(sdl_window_, true);
@@ -225,6 +237,56 @@ void WindowSDL::ApplyNewFullscreen() {
     return;
   }
   SDL_SetWindowFullscreen(sdl_window_, IsFullscreen());
+  if (!IsFullscreen() && pending_client_width_ && pending_client_height_) {
+    ResizeWindowedClientNow(pending_client_width_, pending_client_height_, "kept for when the window left fullscreen");
+    pending_client_width_ = pending_client_height_ = 0;
+  }
+}
+
+void WindowSDL::ResizeWindowedClientNow(uint32_t width, uint32_t height, const char* reason) {
+  const float density = SDL_GetWindowPixelDensity(sdl_window_);
+  const float scale = density > 0.0f ? density : 1.0f;
+  const int w = std::max(1, int(float(width) / scale + 0.5f)), h = std::max(1, int(float(height) / scale + 0.5f));
+  if (!SDL_SetWindowSize(sdl_window_, w, h)) {
+    REXLOG_WARN("WindowSDL: client size {}x{} ({}) refused: {}", width, height, reason, SDL_GetError());
+    return;
+  }
+  REXLOG_INFO("WindowSDL: client size {}x{} ({})", width, height, reason);
+}
+
+void WindowSDL::ApplyWindowedClientSizeImpl(uint32_t width, uint32_t height) {
+  if (!sdl_window_) {
+    return;
+  }
+  if (IsFullscreen()) {
+    pending_client_width_ = width;
+    pending_client_height_ = height;
+    REXLOG_INFO("WindowSDL: windowed client size {}x{} kept for when the window leaves fullscreen", width, height);
+    return;
+  }
+  ResizeWindowedClientNow(width, height, "SetWindowedClientSize");
+}
+
+// The usable area of the window's display in pixels, less the frame where the window system reports one (a Wayland
+// compositor that draws the decorations itself reports none).
+std::vector<std::pair<uint32_t, uint32_t>> WindowSDL::ListWindowedClientSizes() const {
+  if (!sdl_window_) {
+    return {};
+  }
+  const SDL_DisplayID display = SDL_GetDisplayForWindow(sdl_window_);
+  SDL_Rect usable;
+  if (!display || !SDL_GetDisplayUsableBounds(display, &usable)) {
+    return {};
+  }
+  const float density = SDL_GetWindowPixelDensity(sdl_window_);
+  const float scale = density > 0.0f ? density : 1.0f;
+  int top = 0, left = 0, bottom = 0, right = 0;
+  if (!SDL_GetWindowBordersSize(sdl_window_, &top, &left, &bottom, &right)) {
+    top = left = bottom = right = 0;
+  }
+  return display_mode::FittingClientSizes(uint32_t(float(usable.w) * scale), uint32_t(float(usable.h) * scale),
+                                          uint32_t(float(left + right) * scale),
+                                          uint32_t(float(top + bottom) * scale));
 }
 
 void WindowSDL::ApplyNewTitle() {
