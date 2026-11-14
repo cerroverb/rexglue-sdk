@@ -106,6 +106,21 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
     return;
   }
   switch (event.type) {
+    case SDL_EVENT_QUIT: {
+      // SIGINT / SIGTERM (SDL turns them into this event): every window gets the close request its close button
+      // gives, so the app shuts down the same way.
+      std::vector<SDL_WindowID> ids;
+      for (const auto& [id, window] : windows_) ids.push_back(id);
+      for (SDL_WindowID id : ids) {
+        if (WindowSDL* window = GetWindow(id)) {
+          SDL_Event close{};
+          close.type = SDL_EVENT_WINDOW_CLOSE_REQUESTED;
+          close.window.windowID = id;
+          window->HandleWindowEvent(close);
+        }
+      }
+      break;
+    }
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
       if (WindowSDL* window = GetWindow(event.key.windowID)) {
