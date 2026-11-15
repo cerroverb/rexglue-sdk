@@ -284,7 +284,8 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
       result_ptr.guest_address(), overlapped.guest_address());
   std::string title;
   if (title_ptr) {
-    title = rex::string::to_utf8(title_ptr.value());
+    title = rex::string::to_utf8(rex::memory::load_and_swap<std::u16string>(
+        REX_KERNEL_MEMORY()->TranslateVirtual(title_ptr.guest_address())));
   } else {
     title = "";  // TODO(gibbed): default title based on flags?
   }
@@ -297,7 +298,9 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
     buttons.push_back(rex::string::to_utf8(button));
   }
 
-  std::string text = text_ptr ? rex::string::to_utf8(text_ptr.value()) : "";
+  std::string text = text_ptr ? rex::string::to_utf8(rex::memory::load_and_swap<std::u16string>(
+                                    REX_KERNEL_MEMORY()->TranslateVirtual(text_ptr.guest_address())))
+                              : "";
   {
     std::string logged_text;
     logged_text.reserve(text.size());
