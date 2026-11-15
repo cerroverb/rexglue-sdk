@@ -297,6 +297,21 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
     buttons.push_back(rex::string::to_utf8(button));
   }
 
+  std::string text = text_ptr ? rex::string::to_utf8(text_ptr.value()) : "";
+  {
+    std::string logged_text;
+    logged_text.reserve(text.size());
+    for (char c : text) {
+      if (c == '\n') {
+        logged_text += "\\n";
+      } else {
+        logged_text += c;
+      }
+    }
+    REXKRNL_INFO("XamShowMessageBoxUI title \"{}\" text \"{}\" buttons {}", title, logged_text,
+                 buttons.size());
+  }
+
   X_RESULT result;
   if (REXCVAR_GET(headless)) {
     // Auto-pick the focused button.
@@ -329,8 +344,7 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
     ui::ImGuiDrawer* imgui_drawer = emulator->imgui_drawer();
     if (imgui_drawer) {
       result = xeXamDispatchDialog<MessageBoxDialog>(
-          new MessageBoxDialog(imgui_drawer, title, rex::string::to_utf8(text_ptr.value()), buttons,
-                               active_button),
+          new MessageBoxDialog(imgui_drawer, title, text, buttons, active_button),
           close, overlapped.guest_address());
     } else {
       // Fallback to headless if no drawer available
