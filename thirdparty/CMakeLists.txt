@@ -367,6 +367,13 @@ if(REXGLUE_ENABLE_TRACY)
             TRACY_FIBERS
     )
 
+    # Tracy's Linux crash handler is a sigaction(SIGSEGV) installed when the profiler starts, after the runtime's own:
+    # it replaced the handler that serves the guest's write-watched pages, so the first watched write ended the
+    # process. Windows keeps it (a vectored handler there).
+    if(NOT WIN32)
+        target_compile_definitions(TracyClient PRIVATE TRACY_NO_CRASH_HANDLER)
+    endif()
+
     target_compile_options(TracyClient PRIVATE -w)
 
     install(DIRECTORY ${TRACY_PUBLIC_DIR}/tracy
