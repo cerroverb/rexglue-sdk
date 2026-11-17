@@ -34,14 +34,17 @@ REXCVAR_DEFINE_INT32(gpu_refresh_stretch_ms, 0, "GPU",
     .range(0, 10);
 
 // From lmaogoodcodenotreally/rexglue-sdk@59e13bba, where it is on by default;
-// off by default here (the gx trial sets it through DOA4_GX).
+// off by default here (the gx trial sets it through DOA4_GX). The game's Esc menu
+// offers it as "Batch GPU uploads"; the description stays short so the settings
+// overlay's unwrapped tooltip shows it whole. Which pages are uploaded: with
+// clear_memory_page_state on (the default) every page the frame-end reset cleared,
+// written or not, and a CPU write to it before its draw is then caught only by the
+// write watch; with it off, only the pages the CPU has written again since.
 REXCVAR_DEFINE_BOOL(gpu_upload_prefetch, false, "GPU",
                     "Upload in one batch at each frame's end, rather than draw by draw, the guest "
-                    "memory pages draws read two frames ago that are invalid at that point. With "
-                    "clear_memory_page_state on (the default) that is every such page the "
-                    "frame-end reset cleared, written or not, and a CPU write to it before its "
-                    "draw is then caught only by the write watch; with it off, only the pages "
-                    "the CPU has written again since.");
+                    "memory pages draws read two frames ago that are invalid then. Less GPU work a "
+                    "frame; moving parts such as hair can be drawn one frame late now and then. "
+                    "Off by default.");
 
 namespace rex::graphics {
 
