@@ -88,12 +88,19 @@ void D3D12CommandProcessor::ApplyGxSeam() {
     }
   }
   if (!unknown.empty()) {
-    REXGPU_ERROR("gx: DOA4_GX='{}' has an unknown word ({}), so all are off", text, unknown);
+    REXGPU_ERROR(
+        "gx: DOA4_GX='{}' has an unknown word ({}), so timing and n2stretch are off and "
+        "gpu_upload_prefetch is left as configured",
+        text, unknown);
     prefetch = timing = n2stretch = false;
   }
   REXCVAR_SET(d3d12_gpu_timing, timing);
   REXCVAR_SET(gpu_refresh_stretch_ms, n2stretch ? 2 : 0);
-  REXCVAR_SET(gpu_upload_prefetch, prefetch);
+  // Written only when the word is present: gpu_upload_prefetch is carried in the netplay hand-off and
+  // applied (session, replay) before this runs, and a config or command-line value must stand too.
+  if (prefetch) {
+    REXCVAR_SET(gpu_upload_prefetch, true);
+  }
   REXGPU_INFO("gx: prefetch={} timing={} n2stretch={} (DOA4_GX='{}')",
               REXCVAR_GET(gpu_upload_prefetch) ? "on" : "off",
               REXCVAR_GET(d3d12_gpu_timing) ? "on" : "off",
