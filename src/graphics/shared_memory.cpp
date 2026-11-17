@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstring>
 #include <thread>
@@ -28,6 +29,13 @@
 REXCVAR_DEFINE_INT32(gpu_refresh_stretch_ms, 0, "GPU",
                      "Test switch that widens the frame-end valid-flag refresh window by waiting "
                      "this many milliseconds between its copy and its pointer exchange; 0 = off.");
+
+// From lmaogoodcodenotreally/rexglue-sdk@59e13bba, where it is on by default;
+// off by default here (the gx trial sets it through DOA4_GX).
+REXCVAR_DEFINE_BOOL(gpu_upload_prefetch, false, "GPU",
+                    "Upload in one batch at each frame's end the guest memory pages draws "
+                    "read two frames ago and the CPU has written again since, rather than draw "
+                    "by draw.");
 
 namespace rex::graphics {
 
@@ -558,6 +566,7 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     if (!EnsureHostGpuMemoryAllocated(range.first, range.second)) {
       return false;
     }
+    NoteRequested(range.first, range.second);
   }
 
   uint64_t* valid_flags = active_valid_flags_.load(std::memory_order_acquire);
@@ -682,6 +691,106 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
   std::pair<uint32_t, uint32_t> range(start, length);
   return RequestRanges(&range, 1);
+}
+
+bool SharedMemory::UploadPrefetchEnabled() const { return REXCVAR_GET(gpu_upload_prefetch); }
+
+void SharedMemory::NoteRequested(uint32_t start, uint32_t length) {
+  std::vector<uint64_t>& cur = upload_history_[0];
+  if (cur.empty() || !length) {
+    return;
+  }
+  const uint32_t first = start >> page_size_log2_;
+  const uint32_t last = (start + (length - 1)) >> page_size_log2_;
+  for (uint32_t w = first >> 6; w <= last >> 6; ++w) {
+    const uint32_t lo = w == first >> 6 ? first & 63 : 0;
+    const uint32_t hi = w == last >> 6 ? last & 63 : 63;
+    cur[w] |= (~uint64_t(0) >> (63 - (hi - lo))) << lo;
+  }
+}
+
+uint32_t SharedMemory::PrefetchFrameUploads() {
+  if (!UploadPrefetchEnabled()) {
+    return 0;
+  }
+  const size_t words = num_system_page_flags_;
+  if (!words) {
+    return 0;
+  }
+  if (upload_history_[0].size() != words) {
+    for (auto& history : upload_history_) {
+      history.assign(words, 0);
+    }
+    return 0;
+  }
+  upload_history_[2].swap(upload_history_[1]);
+  upload_history_[1].swap(upload_history_[0]);
+  std::fill(upload_history_[0].begin(), upload_history_[0].end(), 0);
+  upload_ranges_.clear();
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    // Adapted: the valid flags here are double-buffered; the active copy is
+    // the one RequestRanges, MakeRangeValid and the invalidation callback use
+    // under this lock (the copies are swapped at a frame's close, by
+    // SetSystemPageBlocksValidWithGpuDataWritten on this same thread).
+    const uint64_t* valid = active_valid_flags_.load(std::memory_order_relaxed);
+    if (!valid) {
+      return 0;
+    }
+    for (size_t i = 0; i < words; ++i) {
+      // Only pages the CPU dirtied: a valid page between them may hold data
+      // the GPU wrote (a resolve), which a copy from CPU memory would undo.
+      uint64_t bits = upload_history_[2][i] & ~valid[i];
+      while (bits) {
+        const uint32_t bit = uint32_t(std::countr_zero(bits));
+        const uint32_t run = uint32_t(std::countr_one(bits >> bit));
+        const uint32_t page = uint32_t(i) * 64 + bit;
+        if (!upload_ranges_.empty() &&
+            upload_ranges_.back().first + upload_ranges_.back().second == page) {
+          upload_ranges_.back().second += run;
+        } else {
+          upload_ranges_.emplace_back(page, run);
+        }
+        bits &= run == 64 ? 0 : ~(((uint64_t(1) << run) - 1) << bit);
+      }
+    }
+  }
+  // Only pages still committed: one drawn from a frame or two ago may have
+  // been freed since (loading), and reading it faults. Checked here, not under
+  // the heap lock through the copy; the guest freeing memory a draw of the
+  // coming frame reads is as unsafe on the on-demand path.
+  memory::VirtualHeap* heap = memory().GetPhysicalHeap();
+  auto readable = [&](uint32_t first, uint32_t count) {
+    return heap->QueryRangeAccess(first << page_size_log2_,
+                                  ((first + count) << page_size_log2_) - 1) !=
+           rex::memory::PageAccess::kNoAccess;
+  };
+  prefetch_ranges_.clear();
+  for (const auto& [first, count] : upload_ranges_) {
+    if (readable(first, count)) {
+      prefetch_ranges_.emplace_back(first, count);
+      continue;
+    }
+    for (uint32_t p = first; p < first + count; ++p) {
+      if (!readable(p, 1)) {
+        continue;
+      }
+      if (!prefetch_ranges_.empty() &&
+          prefetch_ranges_.back().first + prefetch_ranges_.back().second == p) {
+        ++prefetch_ranges_.back().second;
+      } else {
+        prefetch_ranges_.emplace_back(p, 1);
+      }
+    }
+  }
+  uint32_t pages = 0;
+  for (const auto& range : prefetch_ranges_) {
+    pages += range.second;
+  }
+  if (!prefetch_ranges_.empty()) {
+    UploadRanges(prefetch_ranges_);
+  }
+  return pages;
 }
 
 std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallbackThunk(

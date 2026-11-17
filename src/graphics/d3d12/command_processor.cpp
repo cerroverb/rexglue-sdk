@@ -2298,6 +2298,14 @@ bool D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   return refreshed;
 }
 
+void D3D12CommandProcessor::PrefetchFrameUploads() {
+  // Ported from lmaogoodcodenotreally/rexglue-sdk@59e13bba; opens the next
+  // frame's submission only when the prefetch is on.
+  if (shared_memory_ && shared_memory_->UploadPrefetchEnabled() && BeginSubmission(true)) {
+    gpu_timing_prefetch_pages_ += shared_memory_->PrefetchFrameUploads();
+  }
+}
+
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
   if (REXCVAR_GET(d3d12_submit_on_primary_buffer_end) && submission_open_ &&
       CanEndSubmissionImmediately()) {

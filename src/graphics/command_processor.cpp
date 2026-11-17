@@ -1186,6 +1186,8 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   if (action.issue_swap) {
     IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
   }
+  // Once per guest swap, after the frame's IssueSwap here or at the vblank wait before this packet.
+  PrefetchFrameUploads();
 
   ++counter_;
   if (action.count_swap) {

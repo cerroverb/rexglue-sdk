@@ -34,6 +34,8 @@ REXCVAR_DEFINE_BOOL(d3d12_gpu_timing, false, "GPU/D3D12",
 // TEMP DIAGNOSTIC (N2 probe): defined in src/graphics/shared_memory.cpp.
 REXCVAR_DECLARE(int32_t, gpu_refresh_stretch_ms);
 
+REXCVAR_DECLARE(bool, gpu_upload_prefetch);  // src/graphics/shared_memory.cpp
+
 namespace rex::graphics::d3d12 {
 
 namespace {
@@ -91,7 +93,9 @@ void D3D12CommandProcessor::ApplyGxSeam() {
   }
   REXCVAR_SET(d3d12_gpu_timing, timing);
   REXCVAR_SET(gpu_refresh_stretch_ms, n2stretch ? 2 : 0);
-  REXGPU_INFO("gx: prefetch={} timing={} n2stretch={} (DOA4_GX='{}')", prefetch ? "on" : "off",
+  REXCVAR_SET(gpu_upload_prefetch, prefetch);
+  REXGPU_INFO("gx: prefetch={} timing={} n2stretch={} (DOA4_GX='{}')",
+              REXCVAR_GET(gpu_upload_prefetch) ? "on" : "off",
               REXCVAR_GET(d3d12_gpu_timing) ? "on" : "off",
               REXCVAR_GET(gpu_refresh_stretch_ms) > 0 ? "on" : "off", text);
 }
