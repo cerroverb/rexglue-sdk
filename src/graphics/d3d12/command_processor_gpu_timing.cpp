@@ -253,11 +253,12 @@ void D3D12CommandProcessor::GpuTimingHarvest(bool force) {
   const double submit_ms =
       double(submit_cpu - std::min(submit_cpu, gpu_timing_submit_cpu_start_)) * 1.0e-4 *
       per_frame;
-  // TEMP DIAGNOSTIC (N2 probe): per window, not per frame. lock_us_max stays 0
-  // until the refresh takes the global lock.
-  const SharedMemory::RefreshProbe refresh =
-      shared_memory_ ? shared_memory_->TakeRefreshProbe() : SharedMemory::RefreshProbe{0, 0, 0};
-  const double refresh_lock_us_max = 0.0;
+  // TEMP DIAGNOSTIC (N2 probe): per window, not per frame. lock_us_max is the
+  // longest global-lock hold of one frame-end refresh in the window.
+  const SharedMemory::RefreshProbe refresh = shared_memory_
+                                                 ? shared_memory_->TakeRefreshProbe()
+                                                 : SharedMemory::RefreshProbe{0, 0, 0, 0.0};
+  const double refresh_lock_us_max = refresh.lock_us_max;
   REXGPU_INFO(
       "gx timing: secs={:.1f} frames={} gpu_ms_per_frame={:.3f} setup={:.3f} draw={:.3f} "
       "rt={:.3f} tex={:.3f} upload={:.3f} resolve={:.3f} swap={:.3f} idle={:.3f} "

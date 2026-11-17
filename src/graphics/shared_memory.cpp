@@ -17,6 +17,7 @@
 
 #include <rex/assert.h>
 #include <rex/bit.h>
+#include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/shared_memory.h>
@@ -132,6 +133,31 @@ void SharedMemory::InvalidateAllPages() {
 }
 
 void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
+  // The whole refresh holds the global lock, as the invalidation callback does
+  // (official ReXGlue resets these flags under its lock too). Without it a
+  // guest write fault landing between the dirty-mask exchange and the pointer
+  // exchange cleared its page in the buffer about to become staging (or in a
+  // block left out of a partial copy), so the new active buffer kept a stale
+  // valid bit and the GPU kept the stale page; and the dirty-flag reset below
+  // erased that fault's dirty mark. A guest fault now waits at most one
+  // refresh body (a copy of at most num_system_page_flags_ words).
+  auto global_lock = global_critical_region_.Acquire();
+
+  // TEMP DIAGNOSTIC (N2 probe): lock_us_max. The hold is timed from here (the
+  // Acquire's own wait is not in it) to the end of the function, the early
+  // returns included; the stretch's measured duration is subtracted. Declared
+  // after global_lock, so it is destroyed (and records) while the lock is held.
+  struct RefreshLockHoldTimer {
+    SharedMemory& shared_memory;
+    const uint64_t start_ticks;
+    uint64_t excluded_ticks;
+    ~RefreshLockHoldTimer() {
+      const uint64_t held_ticks = rex::chrono::Clock::QueryHostTickCount() - start_ticks;
+      shared_memory.NoteRefreshLockHold(held_ticks > excluded_ticks ? held_ticks - excluded_ticks
+                                                                    : 0);
+    }
+  } lock_hold_timer{*this, rex::chrono::Clock::QueryHostTickCount(), 0};
+
   if (!gpu_written_data_dirty_.load(std::memory_order_relaxed)) {
     return;
   }
@@ -177,14 +203,19 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
   // TEMP DIAGNOSTIC (N2 probe): the test switch that widens the window between
   // the copy and the exchange. A yielding wait on the steady clock, not a
   // sleep: a Windows sleep of 2 ms can last a whole 15.6 ms timer tick.
+  // The wait now sits inside the global lock, so a guest fault that arrives
+  // during it waits instead of landing in the window (test switch only).
   const int32_t stretch_ms = REXCVAR_GET(gpu_refresh_stretch_ms);
   if (stretch_ms > 0) {
+    const uint64_t stretch_start_ticks = rex::chrono::Clock::QueryHostTickCount();
     const auto stretch_end =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(stretch_ms);
     while (std::chrono::steady_clock::now() < stretch_end) {
       std::this_thread::yield();
     }
     refresh_stretches_.fetch_add(1, std::memory_order_relaxed);
+    lock_hold_timer.excluded_ticks =
+        rex::chrono::Clock::QueryHostTickCount() - stretch_start_ticks;
   }
 
   uint64_t* old_active = active_valid_flags_.exchange(staging, std::memory_order_acq_rel);
@@ -194,7 +225,7 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
   // TEMP DIAGNOSTIC (N2 probe): close the window (even), then read the count,
   // walk the stored pages and reset. A stored page is lost if the new active
   // buffer (staging, copied before the callback cleared the page) still says
-  // valid while the GPU-written flags say not valid. Read without the lock.
+  // valid while the GPU-written flags say not valid. Read under the lock.
   refresh_in_window_.fetch_add(1, std::memory_order_seq_cst);
   const uint32_t stored_count = refresh_page_count_.load(std::memory_order_acquire);
   const uint32_t walk_count = std::min(stored_count, kRefreshProbePages);
@@ -221,7 +252,19 @@ SharedMemory::RefreshProbe SharedMemory::TakeRefreshProbe() {
   probe.window_hits = refresh_window_hits_.exchange(0, std::memory_order_relaxed);
   probe.lost = refresh_lost_.exchange(0, std::memory_order_relaxed);
   probe.stretches = refresh_stretches_.exchange(0, std::memory_order_relaxed);
+  const uint64_t lock_ticks_max = refresh_lock_ticks_max_.exchange(0, std::memory_order_relaxed);
+  const uint64_t tick_frequency = rex::chrono::Clock::QueryHostTickFrequency();
+  probe.lock_us_max =
+      tick_frequency ? double(lock_ticks_max) * 1.0e6 / double(tick_frequency) : 0.0;
   return probe;
+}
+
+void SharedMemory::NoteRefreshLockHold(uint64_t ticks) {
+  uint64_t current_max = refresh_lock_ticks_max_.load(std::memory_order_relaxed);
+  while (ticks > current_max &&
+         !refresh_lock_ticks_max_.compare_exchange_weak(current_max, ticks,
+                                                        std::memory_order_relaxed)) {
+  }
 }
 
 void SharedMemory::ClearCache() {
