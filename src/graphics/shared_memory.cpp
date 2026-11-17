@@ -26,16 +26,22 @@
 #include <rex/memory.h>
 
 // TEMP DIAGNOSTIC (N2 probe); the DOA4_GX seam word n2stretch sets it to 2.
+// Bounded to 0..10: the wait spins with the global lock held at every frame
+// end, and the cvar is live in the settings overlay.
 REXCVAR_DEFINE_INT32(gpu_refresh_stretch_ms, 0, "GPU",
                      "Test switch that widens the frame-end valid-flag refresh window by waiting "
-                     "this many milliseconds between its copy and its pointer exchange; 0 = off.");
+                     "this many milliseconds between its copy and its pointer exchange; 0 = off.")
+    .range(0, 10);
 
 // From lmaogoodcodenotreally/rexglue-sdk@59e13bba, where it is on by default;
 // off by default here (the gx trial sets it through DOA4_GX).
 REXCVAR_DEFINE_BOOL(gpu_upload_prefetch, false, "GPU",
-                    "Upload in one batch at each frame's end the guest memory pages draws "
-                    "read two frames ago and the CPU has written again since, rather than draw "
-                    "by draw.");
+                    "Upload in one batch at each frame's end, rather than draw by draw, the guest "
+                    "memory pages draws read two frames ago that are invalid at that point. With "
+                    "clear_memory_page_state on (the default) that is every such page the "
+                    "frame-end reset cleared, written or not, and a CPU write to it before its "
+                    "draw is then caught only by the write watch; with it off, only the pages "
+                    "the CPU has written again since.");
 
 namespace rex::graphics {
 
@@ -738,8 +744,11 @@ uint32_t SharedMemory::PrefetchFrameUploads() {
       return 0;
     }
     for (size_t i = 0; i < words; ++i) {
-      // Only pages the CPU dirtied: a valid page between them may hold data
-      // the GPU wrote (a resolve), which a copy from CPU memory would undo.
+      // Only invalid pages: a valid page between them may hold data the GPU
+      // wrote (a resolve), which a copy from CPU memory would undo. Invalid
+      // means the write watch caught a CPU write, or, with
+      // clear_memory_page_state on, the frame-end refresh just reset the page
+      // (written or not); see PrefetchFrameUploads in the header.
       uint64_t bits = upload_history_[2][i] & ~valid[i];
       while (bits) {
         const uint32_t bit = uint32_t(std::countr_zero(bits));
@@ -757,8 +766,12 @@ uint32_t SharedMemory::PrefetchFrameUploads() {
   }
   // Only pages still committed: one drawn from a frame or two ago may have
   // been freed since (loading), and reading it faults. Checked here, not under
-  // the heap lock through the copy; the guest freeing memory a draw of the
-  // coming frame reads is as unsafe on the on-demand path.
+  // the heap lock through the copy. The on-demand path (no check; it copies
+  // the pages a draw asks for) is exposed to a free before its copy too, but
+  // this set (pages read two swaps ago, which a level load can free) makes a
+  // free between this check and the copy likelier here.
+  // Such a free can fault the copy only with protect_on_release on (default
+  // off, src/system/xmemory.cpp), which makes a released page host NoAccess.
   memory::VirtualHeap* heap = memory().GetPhysicalHeap();
   auto readable = [&](uint32_t first, uint32_t count) {
     return heap->QueryRangeAccess(first << page_size_log2_,

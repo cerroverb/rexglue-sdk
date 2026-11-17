@@ -115,16 +115,29 @@ class SharedMemory {
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
 
-  // Uploads in one batch the pages draws read two frames ago that the CPU has
-  // written again since: the game's per-frame data (dynamic meshes, double-
-  // buffered) is written ahead of the frame drawing it, and fetched draw by
-  // draw it cost a copy and a barrier pair each. Two frames ago, not the last
-  // one: a double buffer's half the last frame read is already being
-  // rewritten for the frame after next. Pages written again after this
-  // upload as before on demand. Call at the end of a frame, in an open
-  // submission, before the next frame's first command. Returns the number of
-  // pages uploaded. Ported from lmaogoodcodenotreally/rexglue-sdk@59e13bba
-  // (gpu_upload_prefetch, off by default here).
+  // Uploads in one batch, and marks valid, the pages draws read two frames
+  // (swaps) ago that are invalid at this point, rather than draw by draw: the
+  // game's per-frame data (dynamic meshes, double-buffered) is written ahead
+  // of the frame drawing it, and fetched draw by draw it cost a copy and a
+  // barrier pair each. Two frames ago, not the last one: a double buffer's
+  // half the last frame read is already being rewritten for the frame after
+  // next. Pages holding GPU-written data are valid, so never uploaded. Which
+  // pages are invalid depends on clear_memory_page_state:
+  // - On (the default): the frame-end refresh that runs right before this
+  //   (SetSystemPageBlocksValidWithGpuDataWritten) resets the pages the GPU
+  //   did not write to invalid, in the blocks it copies. So this re-uploads
+  //   every page of the set that the refresh reset, whether the CPU wrote it
+  //   again or not, and marks it valid again. From this upload until the draw
+  //   that reads the page, a CPU write to it is caught only by the write
+  //   watch; without the prefetch, the draw would re-read the page from CPU
+  //   memory.
+  // - Off: only the pages the write watch invalidated, the ones the CPU has
+  //   written again since; a write after this upload is caught by the watch,
+  //   as on demand.
+  // Call at the end of a frame, in an open submission, before the next
+  // frame's first command. Returns the number of pages uploaded. Ported from
+  // lmaogoodcodenotreally/rexglue-sdk@59e13bba (gpu_upload_prefetch, off by
+  // default here).
   bool UploadPrefetchEnabled() const;
   uint32_t PrefetchFrameUploads();
 
