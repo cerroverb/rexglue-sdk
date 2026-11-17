@@ -10,15 +10,23 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <thread>
 #include <utility>
 
 #include <rex/assert.h>
 #include <rex/bit.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/shared_memory.h>
 #include <rex/math.h>
 #include <rex/memory.h>
+
+// TEMP DIAGNOSTIC (N2 probe); the DOA4_GX seam word n2stretch sets it to 2.
+REXCVAR_DEFINE_INT32(gpu_refresh_stretch_ms, 0, "GPU",
+                     "Test switch that widens the frame-end valid-flag refresh window by waiting "
+                     "this many milliseconds between its copy and its pointer exchange; 0 = off.");
 
 namespace rex::graphics {
 
@@ -137,6 +145,16 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
 
   uint32_t dirty_mask = dirty_blocks_.exchange(0, std::memory_order_relaxed);
   uint32_t dirty_count = rex::bit_count(dirty_mask);
+
+  // TEMP DIAGNOSTIC (N2 probe): open the window (odd) right before the copy.
+  // Entries stored late by a callback of the previous window are wiped here.
+  for (std::atomic<uint32_t>& entry : refresh_pages_) {
+    entry.store(kNoRefreshPage, std::memory_order_relaxed);
+  }
+  refresh_page_count_.store(0, std::memory_order_relaxed);
+  refresh_in_window_.fetch_add(1, std::memory_order_seq_cst);
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+
   if (dirty_count == 0 || dirty_count > 16) {
     std::memcpy(staging, system_page_flags_valid_and_gpu_written_.data(),
                 num_system_page_flags_ * sizeof(uint64_t));
@@ -156,9 +174,54 @@ void SharedMemory::SetSystemPageBlocksValidWithGpuDataWritten() {
     }
   }
 
+  // TEMP DIAGNOSTIC (N2 probe): the test switch that widens the window between
+  // the copy and the exchange. A yielding wait on the steady clock, not a
+  // sleep: a Windows sleep of 2 ms can last a whole 15.6 ms timer tick.
+  const int32_t stretch_ms = REXCVAR_GET(gpu_refresh_stretch_ms);
+  if (stretch_ms > 0) {
+    const auto stretch_end =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(stretch_ms);
+    while (std::chrono::steady_clock::now() < stretch_end) {
+      std::this_thread::yield();
+    }
+    refresh_stretches_.fetch_add(1, std::memory_order_relaxed);
+  }
+
   uint64_t* old_active = active_valid_flags_.exchange(staging, std::memory_order_acq_rel);
   staging_valid_flags_.store(old_active, std::memory_order_release);
   gpu_written_data_dirty_.store(false, std::memory_order_relaxed);
+
+  // TEMP DIAGNOSTIC (N2 probe): close the window (even), then read the count,
+  // walk the stored pages and reset. A stored page is lost if the new active
+  // buffer (staging, copied before the callback cleared the page) still says
+  // valid while the GPU-written flags say not valid. Read without the lock.
+  refresh_in_window_.fetch_add(1, std::memory_order_seq_cst);
+  const uint32_t stored_count = refresh_page_count_.load(std::memory_order_acquire);
+  const uint32_t walk_count = std::min(stored_count, kRefreshProbePages);
+  uint64_t lost = 0;
+  for (uint32_t i = 0; i < walk_count; ++i) {
+    const uint32_t page = refresh_pages_[i].load(std::memory_order_acquire);
+    if (page == kNoRefreshPage || (page >> 6) >= num_system_page_flags_) {
+      continue;  // counted by the callback but not stored yet: dropped
+    }
+    const uint64_t page_bit = uint64_t(1) << (page & 63);
+    if ((staging[page >> 6] & page_bit) &&
+        !(system_page_flags_valid_and_gpu_written_[page >> 6] & page_bit)) {
+      ++lost;
+    }
+  }
+  if (lost) {
+    refresh_lost_.fetch_add(lost, std::memory_order_relaxed);
+  }
+  refresh_page_count_.store(0, std::memory_order_relaxed);
+}
+
+SharedMemory::RefreshProbe SharedMemory::TakeRefreshProbe() {
+  RefreshProbe probe;
+  probe.window_hits = refresh_window_hits_.exchange(0, std::memory_order_relaxed);
+  probe.lost = refresh_lost_.exchange(0, std::memory_order_relaxed);
+  probe.stretches = refresh_stretches_.exchange(0, std::memory_order_relaxed);
+  return probe;
 }
 
 void SharedMemory::ClearCache() {
@@ -599,6 +662,12 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
 
   auto global_lock = global_critical_region_.Acquire();
 
+  // TEMP DIAGNOSTIC (N2 probe): the refresh window before this callback loads
+  // the active buffer, and the page the guest wrote (before the widening below,
+  // which only adds pages whose contents did not change).
+  const uint32_t refresh_window_before = refresh_in_window_.load(std::memory_order_seq_cst);
+  const uint32_t probe_page = page_first;
+
   if (!exact_range) {
     // Check if a somewhat wider range (up to 256 KB with 4 KB pages) can be
     // invalidated - if no GPU-written data nearby that was not intended to be
@@ -639,6 +708,19 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   }
   gpu_written_data_dirty_.store(true, std::memory_order_relaxed);
   dirty_blocks_.fetch_or(dirty_blocks_mask, std::memory_order_relaxed);
+
+  // TEMP DIAGNOSTIC (N2 probe): a hit if the window was open before or after
+  // the clears above, or one opened and closed while they ran.
+  std::atomic_thread_fence(std::memory_order_seq_cst);
+  const uint32_t refresh_window_after = refresh_in_window_.load(std::memory_order_seq_cst);
+  if ((refresh_window_before & 1) || (refresh_window_after & 1) ||
+      refresh_window_before != refresh_window_after) {
+    refresh_window_hits_.fetch_add(1, std::memory_order_relaxed);
+    const uint32_t probe_index = refresh_page_count_.fetch_add(1, std::memory_order_relaxed);
+    if (probe_index < kRefreshProbePages) {
+      refresh_pages_[probe_index].store(probe_page, std::memory_order_release);
+    }
+  }
 
   FireWatches(page_first, page_last, false);
 

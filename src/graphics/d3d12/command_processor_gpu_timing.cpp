@@ -31,6 +31,8 @@ REXCVAR_DEFINE_BOOL(d3d12_gpu_timing, false, "GPU/D3D12",
                     "target transfers, texture loads, uploads, resolves, presenting) per frame "
                     "every 10 seconds, from timestamp queries, with the CPU time of the GPU "
                     "command thread and of the submit worker.");
+// TEMP DIAGNOSTIC (N2 probe): defined in src/graphics/shared_memory.cpp.
+REXCVAR_DECLARE(int32_t, gpu_refresh_stretch_ms);
 
 namespace rex::graphics::d3d12 {
 
@@ -56,7 +58,7 @@ void D3D12CommandProcessor::ApplyGxSeam() {
   applied = true;
   const char* env = std::getenv("DOA4_GX");
   const std::string text = env ? env : "";
-  bool prefetch = false, async = false, timing = false;
+  bool prefetch = false, timing = false, n2stretch = false;
   std::string unknown;
   if (!text.empty()) {
     size_t start = 0;
@@ -68,10 +70,10 @@ void D3D12CommandProcessor::ApplyGxSeam() {
       const std::string_view word(text.data() + start, end - start);
       if (word == "prefetch") {
         prefetch = true;
-      } else if (word == "async") {
-        async = true;
       } else if (word == "timing") {
         timing = true;
+      } else if (word == "n2stretch") {
+        n2stretch = true;
       } else {
         unknown += unknown.empty() ? "'" : ", '";
         unknown += word;
@@ -85,11 +87,13 @@ void D3D12CommandProcessor::ApplyGxSeam() {
   }
   if (!unknown.empty()) {
     REXGPU_ERROR("gx: DOA4_GX='{}' has an unknown word ({}), so all are off", text, unknown);
-    prefetch = async = timing = false;
+    prefetch = timing = n2stretch = false;
   }
   REXCVAR_SET(d3d12_gpu_timing, timing);
-  REXGPU_INFO("gx: prefetch={} async={} timing={} (DOA4_GX='{}')", prefetch ? "on" : "off",
-              async ? "on" : "off", REXCVAR_GET(d3d12_gpu_timing) ? "on" : "off", text);
+  REXCVAR_SET(gpu_refresh_stretch_ms, n2stretch ? 2 : 0);
+  REXGPU_INFO("gx: prefetch={} timing={} n2stretch={} (DOA4_GX='{}')", prefetch ? "on" : "off",
+              REXCVAR_GET(d3d12_gpu_timing) ? "on" : "off",
+              REXCVAR_GET(gpu_refresh_stretch_ms) > 0 ? "on" : "off", text);
 }
 
 void D3D12CommandProcessor::GpuTimingBeginSubmission() {
@@ -249,12 +253,18 @@ void D3D12CommandProcessor::GpuTimingHarvest(bool force) {
   const double submit_ms =
       double(submit_cpu - std::min(submit_cpu, gpu_timing_submit_cpu_start_)) * 1.0e-4 *
       per_frame;
+  // TEMP DIAGNOSTIC (N2 probe): per window, not per frame. lock_us_max stays 0
+  // until the refresh takes the global lock.
+  const SharedMemory::RefreshProbe refresh =
+      shared_memory_ ? shared_memory_->TakeRefreshProbe() : SharedMemory::RefreshProbe{0, 0, 0};
+  const double refresh_lock_us_max = 0.0;
   REXGPU_INFO(
       "gx timing: secs={:.1f} frames={} gpu_ms_per_frame={:.3f} setup={:.3f} draw={:.3f} "
       "rt={:.3f} tex={:.3f} upload={:.3f} resolve={:.3f} swap={:.3f} idle={:.3f} "
       "submissions={} overflows={} | gpu_thread_cpu_ms_per_frame={:.3f} "
       "submit_cpu_ms_per_frame={:.3f} | upload_calls={:.1f} upload_copies={:.1f} "
-      "upload_kb={:.1f} per frame | prefetch_pages={:.1f} per frame{}",
+      "upload_kb={:.1f} per frame | prefetch_pages={:.1f} per frame | refresh hits={} lost={} "
+      "stretches={} lock_us_max={:.3f}{}",
       seconds, frames, busy, ms(size_t(GpuZone::kSetup)), ms(size_t(GpuZone::kDraw)),
       ms(size_t(GpuZone::kRenderTargets)), ms(size_t(GpuZone::kTextures)),
       ms(size_t(GpuZone::kUploads)), ms(size_t(GpuZone::kResolves)), ms(size_t(GpuZone::kSwap)),
@@ -262,7 +272,8 @@ void D3D12CommandProcessor::GpuTimingHarvest(bool force) {
       submit_ms, double(gpu_timing_upload_calls_) * per_frame,
       double(gpu_timing_upload_copies_) * per_frame,
       double(gpu_timing_upload_bytes_) / 1024.0 * per_frame,
-      double(gpu_timing_prefetch_pages_) * per_frame, force ? " (at shutdown)" : "");
+      double(gpu_timing_prefetch_pages_) * per_frame, refresh.window_hits, refresh.lost,
+      refresh.stretches, refresh_lock_us_max, force ? " (at shutdown)" : "");
   gpu_timing_upload_calls_ = gpu_timing_upload_copies_ = 0;
   gpu_timing_upload_bytes_ = gpu_timing_prefetch_pages_ = 0;
   std::fill(std::begin(gpu_timing_ticks_), std::end(gpu_timing_ticks_), 0);

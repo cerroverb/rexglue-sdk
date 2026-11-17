@@ -35,6 +35,20 @@ class SharedMemory {
   void SetSystemPageBlocksValidWithGpuDataWritten();
   void InvalidateAllPages();
 
+  // TEMP DIAGNOSTIC (N2 probe): CPU writes that land inside the frame-end
+  // valid-flag refresh, which runs without the global lock. Counted since the
+  // last TakeRefreshProbe: window_hits = invalidation callbacks that saw the
+  // refresh window open, lost = stored pages left valid in the new active
+  // buffer although cleared in the GPU-written flags, stretches = refreshes
+  // that waited gpu_refresh_stretch_ms between their copy and the exchange.
+  struct RefreshProbe {
+    uint64_t window_hits;
+    uint64_t lost;
+    uint64_t stretches;
+  };
+  // Returns the counters and zeroes them.
+  RefreshProbe TakeRefreshProbe();
+
   typedef void (*GlobalWatchCallback)(const std::unique_lock<std::recursive_mutex>& global_lock,
                                       void* context, uint32_t address_first, uint32_t address_last,
                                       bool invalidated_by_gpu);
@@ -200,6 +214,22 @@ class SharedMemory {
   std::atomic<bool> gpu_written_data_dirty_{false};
   std::atomic<uint32_t> dirty_blocks_{0};
   uint32_t num_system_page_flags_ = 0;
+
+  // TEMP DIAGNOSTIC (N2 probe). refresh_in_window_ is odd while the frame-end
+  // refresh is between the start of its copy and its last flag store (the
+  // refresh adds 1 when it opens and 1 when it closes), so an invalidation
+  // callback that reads it before and after its clears also sees a window it
+  // straddled. The callback (under the global lock) stores the first page it
+  // was asked to invalidate into refresh_pages_ (kNoRefreshPage = not stored
+  // yet); the refresh walks them without the lock after it closes the window.
+  static constexpr uint32_t kRefreshProbePages = 64;
+  static constexpr uint32_t kNoRefreshPage = UINT32_MAX;
+  std::atomic<uint32_t> refresh_in_window_{0};
+  std::atomic<uint32_t> refresh_page_count_{0};
+  std::atomic<uint32_t> refresh_pages_[kRefreshProbePages] = {};
+  std::atomic<uint64_t> refresh_window_hits_{0};
+  std::atomic<uint64_t> refresh_lost_{0};
+  std::atomic<uint64_t> refresh_stretches_{0};
 
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range);
