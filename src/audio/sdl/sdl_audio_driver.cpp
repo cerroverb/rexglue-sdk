@@ -17,6 +17,7 @@
 #include <rex/assert.h>
 #include <rex/audio/conversion.h>
 #include <rex/audio/flags.h>
+#include <rex/audio/output_gain.h>
 #include <rex/audio/speaker_mode.h>
 #include <rex/audio/sdl/sdl_audio_driver.h>
 #include <rex/cvar.h>
@@ -29,6 +30,10 @@ REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
 REXCVAR_DEFINE_STRING(audio_speakers, "auto", "Audio",
                       "Speaker layout: auto (follow the device), stereo, or surround (5.1)")
     .allowed({"auto", "stereo", "surround"});
+REXCVAR_DEFINE_INT32(audio_volume, rex::audio::kVolumePercentDefault, "Audio",
+                     "Master volume in percent (0-300). Above 100 a limiter keeps loud moments from "
+                     "clipping.")
+    .range(rex::audio::kVolumePercentMin, rex::audio::kVolumePercentMax);
 
 namespace rex::audio {
 namespace {
@@ -228,6 +233,15 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
           default:
             assert_unhandled_case(driver->sdl_device_channels_);
             break;
+        }
+        // Master volume, the stereo downmix's make-up gain and the limiter (output_gain.h). The cvar is
+        // read per chunk, so a change is heard at once.
+        const float gain =
+            OutputGainFor(REXCVAR_GET(audio_volume), driver->sdl_device_channels_);
+        if (driver->output_gain_.Process(data, size_t(sample_count), gain) &&
+            driver->limited_chunks_++ == 0) {
+          REXAPU_INFO("Audio output: the limiter engaged for the first time (audio_volume={})",
+                      REXCVAR_GET(audio_volume));
         }
       }
       if (!SDL_PutAudioStreamData(stream, data, len)) {

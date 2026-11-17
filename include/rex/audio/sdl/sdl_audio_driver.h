@@ -16,6 +16,7 @@
 #include <stack>
 
 #include <rex/audio/audio_driver.h>
+#include <rex/audio/output_gain.h>
 #include <rex/thread.h>
 
 #include <SDL3/SDL.h>
@@ -40,6 +41,9 @@ class SDLAudioDriver : public AudioDriver {
   SDL_AudioStream* sdl_stream_ = nullptr;
   bool sdl_initialized_ = false;
   uint8_t sdl_device_channels_ = 0;
+  // Used by SDLCallback only (the audio device's thread).
+  OutputGain output_gain_ = {};
+  uint64_t limited_chunks_ = 0;
 
   static const uint32_t frame_frequency_ = 48000;
   static const uint32_t frame_channels_ = 6;
