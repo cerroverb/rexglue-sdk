@@ -31,7 +31,7 @@ REXCVAR_DEFINE_STRING(audio_speakers, "auto", "Audio",
                       "Speaker layout: auto (follow the device), stereo, or surround (5.1)")
     .allowed({"auto", "stereo", "surround"});
 REXCVAR_DEFINE_INT32(audio_volume, rex::audio::kVolumePercentDefault, "Audio",
-                     "Master volume in percent (0-300). Above 100 a limiter keeps loud moments from "
+                     "Master volume in percent (0-200). Above 100 a limiter keeps loud moments from "
                      "clipping.")
     .range(rex::audio::kVolumePercentMin, rex::audio::kVolumePercentMax);
 

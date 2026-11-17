@@ -12,7 +12,7 @@ namespace rex::audio {
 
 // audio_volume's range, in percent.
 constexpr int32_t kVolumePercentMin = 0;
-constexpr int32_t kVolumePercentMax = 300;
+constexpr int32_t kVolumePercentMax = 200;
 constexpr int32_t kVolumePercentDefault = 100;
 
 // The stereo downmix (conversion.h) divides its sum of front, back and half the centre by 2.5 so that

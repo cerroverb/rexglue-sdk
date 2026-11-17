@@ -42,13 +42,14 @@ static void TestGainFor() {
   CHECK(OutputGainFor(50, 6) == 0.5f);
   CHECK(OutputGainFor(0, 2) == 0.0f);
   CHECK(OutputGainFor(0, 6) == 0.0f);
-  // Both edges of the range (0 and 300 are the cvar's documented limits).
-  CHECK(Near(OutputGainFor(300, 6), 3.0f));
-  CHECK(Near(OutputGainFor(301, 6), 3.0f));  // not 3.01: clamped
-  CHECK(Near(OutputGainFor(299, 6), 2.99f));
+  // Both edges of the range (0 and 200 are the cvar's documented limits).
+  CHECK(Near(OutputGainFor(200, 6), 2.0f));
+  CHECK(Near(OutputGainFor(201, 6), 2.0f));  // not 2.01: clamped
+  CHECK(Near(OutputGainFor(300, 6), 2.0f));  // not 3.0: the old top
+  CHECK(Near(OutputGainFor(199, 6), 1.99f));
   CHECK(OutputGainFor(-1, 6) == 0.0f);  // not -0.01: clamped
   CHECK(Near(OutputGainFor(1, 6), 0.01f));
-  CHECK(kVolumePercentMin == 0 && kVolumePercentMax == 300 && kVolumePercentDefault == 100);
+  CHECK(kVolumePercentMin == 0 && kVolumePercentMax == 200 && kVolumePercentDefault == 100);
 }
 
 // At gain 1 with nothing over the ceiling the samples are untouched, bit for bit.
