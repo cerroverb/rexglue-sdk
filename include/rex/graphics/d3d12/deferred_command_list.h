@@ -33,6 +33,7 @@ class DeferredCommandList {
                       size_t initial_size_bytes = 1_MiB);
 
   void Reset();
+  size_t size() const { return command_stream_.size(); }  // grows with every command
   void Execute(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList1* command_list_1);
 
   D3D12_RECT* ClearDepthStencilViewAllocatedRects(D3D12_CPU_DESCRIPTOR_HANDLE depth_stencil_view,

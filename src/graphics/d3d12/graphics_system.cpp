@@ -44,6 +44,8 @@ void D3D12GraphicsSystem::CreateProvider(bool /*with_presentation*/) {
 }
 
 std::unique_ptr<CommandProcessor> D3D12GraphicsSystem::CreateCommandProcessor() {
+  // TEMP DIAGNOSTIC (gx trial): before the command processor's thread starts.
+  D3D12CommandProcessor::ApplyGxSeam();
   return std::unique_ptr<CommandProcessor>(new D3D12CommandProcessor(this, kernel_state_));
 }
 

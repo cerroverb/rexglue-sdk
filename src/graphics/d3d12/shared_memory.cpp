@@ -370,8 +370,11 @@ bool D3D12SharedMemory::UploadRanges(
   if (upload_page_ranges.empty()) {
     return true;
   }
+  D3D12CommandProcessor::GpuZoneScope gpu_zone(
+      command_processor_, D3D12CommandProcessor::GpuZone::kUploads);  // TEMP DIAGNOSTIC
   CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
   command_processor_.SubmitBarriers();
+  ++command_processor_.gpu_timing_upload_calls_;  // TEMP DIAGNOSTIC
   auto& command_list = command_processor_.GetDeferredCommandList();
   for (auto upload_range : upload_page_ranges) {
     uint32_t upload_range_start = upload_range.first;
@@ -393,6 +396,8 @@ bool D3D12SharedMemory::UploadRanges(
       std::memcpy(upload_buffer_mapping,
                   memory().TranslatePhysical(upload_range_start << page_size_log2()),
                   upload_buffer_size);
+      ++command_processor_.gpu_timing_upload_copies_;  // TEMP DIAGNOSTIC
+      command_processor_.gpu_timing_upload_bytes_ += upload_buffer_size;
       command_list.D3DCopyBufferRegion(buffer_, upload_range_start << page_size_log2(),
                                        upload_buffer, UINT64(upload_buffer_offset),
                                        UINT64(upload_buffer_size));

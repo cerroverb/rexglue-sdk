@@ -1655,6 +1655,18 @@ bool D3D12CommandProcessor::SetupContext() {
 
 void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  // TEMP DIAGNOSTIC (d3d12_gpu_timing): the last window, then its resources.
+  GpuTimingHarvest(true);
+  gpu_timing_failed_ = true;  // no new timestamp resources past this point
+  gpu_timing_slot_ = nullptr;
+  gpu_timing_slots_.clear();
+  gpu_timing_mapping_ = nullptr;
+  gpu_timing_readback_.Reset();
+  gpu_timing_heap_.Reset();
+  if (gpu_timing_gpu_thread_) {
+    CloseHandle(gpu_timing_gpu_thread_);
+    gpu_timing_gpu_thread_ = nullptr;
+  }
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -1922,6 +1934,7 @@ bool D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
   pace_stats::Mark(pace_stats::kSwap);
+  ++gpu_timing_frames_;  // TEMP DIAGNOSTIC (d3d12_gpu_timing)
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -2016,6 +2029,7 @@ bool D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       guest_output_width, guest_output_height, display_width, display_height,
       [this, &swap_texture_srv_desc, frontbuffer_format, swap_texture_resource, guest_output_width,
        guest_output_height](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+        GpuZoneScope gpu_zone(*this, GpuZone::kSwap);  // TEMP DIAGNOSTIC
         const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
         ID3D12Device* device = provider.GetDevice();
 
@@ -2359,6 +2373,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     return false;
   }
 
+  SetGpuZone(GpuZone::kSetup);  // TEMP DIAGNOSTIC
   // Process primitives.
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
   if (!primitive_processor_->Process(primitive_processing_result)) {
@@ -2392,9 +2407,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   uint32_t normalized_color_mask =
       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
                    : 0;
-  if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
-                                    normalized_color_mask, *vertex_shader)) {
-    return false;
+  {
+    GpuZoneScope gpu_zone(*this, GpuZone::kRenderTargets);  // TEMP DIAGNOSTIC
+    if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+                                      normalized_color_mask, *vertex_shader)) {
+      return false;
+    }
   }
 
   // Create the pipeline (for this, need the actually used render target formats
@@ -2437,7 +2455,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   uint32_t used_texture_mask =
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
-  texture_cache_->RequestTextures(used_texture_mask);
+  {
+    GpuZoneScope gpu_zone(*this, GpuZone::kTextures);  // TEMP DIAGNOSTIC
+    texture_cache_->RequestTextures(used_texture_mask);
+  }
 
   // Bind the pipeline after configuring it and doing everything that may bind
   // other pipelines.
@@ -2655,6 +2676,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     } else {
       shared_memory_->UseForReading();
     }
+    SetGpuZone(GpuZone::kDraw);  // TEMP DIAGNOSTIC
     SubmitBarriers();
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
@@ -2714,6 +2736,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     } else {
       shared_memory_->UseForReading();
     }
+    SetGpuZone(GpuZone::kDraw);  // TEMP DIAGNOSTIC
     SubmitBarriers();
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
@@ -2924,6 +2947,7 @@ bool D3D12CommandProcessor::IssueCopy() {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+  GpuZoneScope gpu_zone(*this, GpuZone::kResolves);  // TEMP DIAGNOSTIC
   if (!BeginSubmission(true)) {
     return false;
   }
@@ -3352,6 +3376,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     // end of the submission (when async pipeline creation requests are
     // fulfilled).
     deferred_command_list_.Reset();
+    GpuTimingBeginSubmission();  // TEMP DIAGNOSTIC
 
     // Reset cached state of the command list.
     ff_viewport_update_needed_ = true;
@@ -3471,6 +3496,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // Submit barriers now because resources with the queued barriers may be
     // destroyed between frames.
     SubmitBarriers();
+    GpuTimingEndSubmission();  // TEMP DIAGNOSTIC
 
     ID3D12CommandQueue* direct_queue = provider.GetDirectQueue();
 

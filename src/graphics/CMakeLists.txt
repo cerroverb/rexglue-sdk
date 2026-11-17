@@ -79,6 +79,7 @@ if(REXGLUE_USE_D3D12)
     set(REXGRAPHICS_D3D12_SOURCES
         d3d12/graphics_system.cpp
         d3d12/command_processor.cpp
+        d3d12/command_processor_gpu_timing.cpp
         d3d12/primitive_processor.cpp
         d3d12/render_target_cache.cpp
         d3d12/shader.cpp

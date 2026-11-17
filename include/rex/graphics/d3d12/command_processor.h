@@ -76,6 +76,49 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t GetCurrentSubmission() const { return submission_current_; }
   uint64_t GetCompletedSubmission() const { return submission_completed_; }
 
+  // TEMP DIAGNOSTIC (gx trial): reads the DOA4_GX environment variable once,
+  // before the command processor starts, and sets the trial's cvars from it
+  // (command_processor_gpu_timing.cpp). Always logs one "gx:" line.
+  static void ApplyGxSeam();
+
+  // TEMP DIAGNOSTIC (d3d12_gpu_timing, command_processor_gpu_timing.cpp): the
+  // kind of GPU work being recorded, timed where it changes. Ported from
+  // lmaogoodcodenotreally/rexglue-sdk@59e13bba without its frame interpolation
+  // and added-effects kinds.
+  enum class GpuZone : uint8_t {
+    kSetup,  // draw setup not below: index conversion, barriers, bindings
+    kDraw,
+    kRenderTargets,  // render target transfers and clears
+    kTextures,       // texture loads
+    kUploads,        // shared memory uploads
+    kResolves,
+    kSwap,  // presenting the frame
+    kCount,
+  };
+  void SetGpuZone(GpuZone zone) {
+    if (zone != gpu_zone_) {
+      gpu_zone_ = zone;
+      if (gpu_timing_slot_) {
+        SetGpuZoneSlow(zone);
+      }
+    }
+  }
+  // Shared memory upload traffic and prefetched pages, for the same log.
+  uint64_t gpu_timing_upload_calls_ = 0, gpu_timing_upload_copies_ = 0,
+           gpu_timing_upload_bytes_ = 0, gpu_timing_prefetch_pages_ = 0;
+  // Times what it records as `zone`, then goes back to the enclosing kind.
+  class GpuZoneScope {
+   public:
+    GpuZoneScope(D3D12CommandProcessor& cp, GpuZone zone) : cp_(cp), outer_(cp.gpu_zone_) {
+      cp_.SetGpuZone(zone);
+    }
+    ~GpuZoneScope() { cp_.SetGpuZone(outer_); }
+
+   private:
+    D3D12CommandProcessor& cp_;
+    GpuZone outer_;
+  };
+
   // Must be called when a subsystem does something like UpdateTileMappings so
   // it can be awaited in CheckSubmissionFence(submission_current_) if it was
   // done after the latest ExecuteCommandLists + Signal.
@@ -655,6 +698,42 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint32_t readback_buffer_size_ = 0;
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
+
+  // TEMP DIAGNOSTIC (d3d12_gpu_timing).
+  static constexpr uint32_t kGpuTimingSlots = 64, kGpuTimingPerSlot = 4096;
+  struct GpuTimingSlot {
+    uint64_t submission = 0;
+    uint32_t count = 0;
+    bool pending = false;  // resolved, waiting for the submission's fence
+    std::array<uint8_t, kGpuTimingPerSlot> zone;  // of the time after each timestamp
+  };
+  void GpuTimingBeginSubmission();
+  void GpuTimingEndSubmission();
+  void GpuTimingStamp(GpuZone zone_after);
+  void SetGpuZoneSlow(GpuZone zone);
+  // Reads back the completed submissions' timestamps; logs the window when
+  // 10 s have passed, or now if `force` (at shutdown).
+  void GpuTimingHarvest(bool force);
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> gpu_timing_heap_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> gpu_timing_readback_;
+  const uint64_t* gpu_timing_mapping_ = nullptr;
+  bool gpu_timing_failed_ = false;
+  std::vector<GpuTimingSlot> gpu_timing_slots_;
+  GpuTimingSlot* gpu_timing_slot_ = nullptr;  // the open submission's, while timed
+  GpuZone gpu_zone_ = GpuZone::kSetup;
+  size_t gpu_timing_mark_ = 0;  // deferred command list size after the last timestamp
+  uint64_t gpu_timing_frequency_ = 0;
+  uint64_t gpu_timing_last_submission_ = 0, gpu_timing_last_end_ = 0;
+  uint64_t gpu_timing_ticks_[size_t(GpuZone::kCount) + 1] = {};  // + between submissions
+  uint64_t gpu_timing_submissions_ = 0, gpu_timing_overflows_ = 0;
+  uint64_t gpu_timing_window_start_ = 0;  // host ticks
+  // Swaps seen by IssueSwap (frames), and the CPU time of the GPU command
+  // thread and of the submit worker (100 ns units, GetThreadTimes) at the
+  // window's start.
+  uint64_t gpu_timing_frames_ = 0;
+  HANDLE gpu_timing_gpu_thread_ = nullptr;  // duplicated, the GPU command thread's
+  uint64_t gpu_timing_gpu_thread_cpu_start_ = 0, gpu_timing_submit_cpu_start_ = 0;
+  uint64_t GpuTimingSubmitThreadCpu();  // 0 if there is no submit worker
 
   static constexpr uint32_t kMaxOcclusionQueries = 8192;
   Microsoft::WRL::ComPtr<ID3D12QueryHeap> occlusion_query_heap_;
