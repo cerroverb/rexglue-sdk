@@ -18,7 +18,14 @@
 #include <rex/input/flags.h>
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/logging.h>
+#include <rex/thread.h>
 #include <rex/ui/virtual_key.h>
+
+#include <chrono>
+
+#if REX_PLATFORM_WIN32
+#include <Windows.h>
+#endif
 
 #include "sdl_pad_trace.h"
 
@@ -34,12 +41,66 @@ REXCVAR_DEFINE_STRING(pad_remap_p3, "", "Input",
 REXCVAR_DEFINE_STRING(pad_remap_p4, "", "Input",
                       "Player 4 controller remap: target=source pairs, e.g. A=B,B=A");
 
+REXCVAR_DEFINE_BOOL(pad_fresh_read, true, "Input",
+                    "Refresh the controllers just before the game reads them (off: the background "
+                    "refresh of 0.3.6)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::input::sdl {
 
 static_assert(HID_SDL_TRIGG_THRES == kPadTriggerThreshold);
 
 static constexpr std::array<std::string_view, HID_SDL_USER_COUNT> kPadRemapCvars = {
     "pad_remap_p1", "pad_remap_p2", "pad_remap_p3", "pad_remap_p4"};
+
+// The fresh read: how long a read waits for its refresh round.
+static constexpr std::chrono::milliseconds kPadFreshWaitLimit(2);
+
+static const char* PadWaitResultName(PadRefresher::Result result) {
+  switch (result) {
+    case PadRefresher::Result::kFresh:
+      return "fresh";
+    case PadRefresher::Result::kRecent:
+      return "recent";
+    case PadRefresher::Result::kTimedOut:
+      return "timed_out";
+    case PadRefresher::Result::kSkipped:
+      return "skipped";
+    case PadRefresher::Result::kStopped:
+      return "stopped";
+  }
+  return "unknown";
+}
+
+// Asks the pad thread for a refresh round and waits for it, so that the events
+// the caller takes next are the newest. Called with no driver lock held. Does
+// nothing when the switch is off (`refresher` null).
+static void WaitForFreshPads(PadRefresher* refresher, padtrace::Sample& trace_row) {
+  if (!refresher) {
+    return;
+  }
+  const bool traced = padtrace::On();
+  std::chrono::steady_clock::time_point begin;
+  if (traced) {
+    begin = std::chrono::steady_clock::now();
+  }
+  const PadRefresher::Result result = refresher->RefreshAndWait(kPadFreshWaitLimit);
+  if (traced) {
+    trace_row.SetWait(std::chrono::duration_cast<std::chrono::microseconds>(
+                          std::chrono::steady_clock::now() - begin)
+                          .count(),
+                      PadWaitResultName(result));
+  }
+  if (result == PadRefresher::Result::kTimedOut) {
+    const uint64_t timed_out = refresher->counts().timed_out;
+    if (timed_out <= 3) {
+      REXLOG_WARN(
+          "SDL pad fresh read: a refresh round took longer than 2 ms, this read used the cached "
+          "state ({})",
+          timed_out);
+    }
+  }
+}
 
 SDLInputDriver::SDLInputDriver(rex::ui::Window* window, size_t window_z_order)
     : InputDriver(window, window_z_order),
@@ -133,6 +194,34 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
       }
       SDL_Gamepad_initialized_ = true;
 
+      // The fresh read. The switch is read here only: a change needs a restart.
+      if (REXCVAR_GET(pad_fresh_read)) {
+        PadRefresher::Options options;
+        options.refresh = []() {
+          padtrace::RoundBegin();
+          SDL_UpdateGamepads();
+          padtrace::RoundEnd();
+        };
+        options.thread_setup = []() {
+          rex::thread::set_current_thread_name("Pad refresh");
+#if REX_PLATFORM_WIN32
+          // A round must not queue behind the game's worker threads: the read
+          // waits for it.
+          SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+#endif
+        };
+        pad_refresher_ = std::make_unique<PadRefresher>(std::move(options));
+        if (pad_refresher_->running()) {
+          REXLOG_INFO("SDL pad fresh read: on (pad_fresh_read true)");
+        } else {
+          REXLOG_WARN(
+              "SDL pad fresh read: the refresh thread could not start, reads use the background "
+              "refresh");
+        }
+      } else {
+        REXLOG_INFO("SDL pad fresh read: off (pad_fresh_read false)");
+      }
+
       // Load custom controller mappings if available
       if (!REXCVAR_GET(hid_mappings_file).empty()) {
         std::filesystem::path mappings_path(REXCVAR_GET(hid_mappings_file));
@@ -158,6 +247,14 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
 void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
   if (attached_window_) {
     attached_window_->RemoveListener(this);
+    // Stop the pad thread before the pads and SDL's subsystems go: it calls
+    // into SDL. The object stays, so a read that comes later returns at once.
+    if (pad_refresher_) {
+      const PadRefresher::Counts counts = pad_refresher_->counts();
+      REXLOG_INFO("SDL pad fresh read: {} fresh, {} recent, {} timed out, {} skipped, {} rounds",
+                  counts.fresh, counts.recent, counts.timed_out, counts.skipped, counts.rounds);
+      pad_refresher_->Stop();
+    }
     if (sdl_pumpevents_queued_) {
       attached_window_->app_context().CallInUIThreadSynchronous(
           [this]() { attached_window_->app_context().ExecutePendingFunctionsFromUIThread(); });
@@ -222,6 +319,7 @@ X_RESULT SDLInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
   trace_row.active = is_active;
   trace_row.queued_before = sdl_pumpevents_queued_.load();
   if (is_active) {
+    WaitForFreshPads(pad_refresher_.get(), trace_row);
     QueueControllerUpdate("state");
   }
   trace_row.Snapshot();
@@ -379,6 +477,7 @@ X_RESULT SDLInputDriver::GetKeystroke(uint32_t users, uint32_t flags,
   trace_row.active = is_active;
   trace_row.queued_before = sdl_pumpevents_queued_.load();
   if (is_active) {
+    WaitForFreshPads(pad_refresher_.get(), trace_row);
     QueueControllerUpdate("key");
   }
   trace_row.Snapshot();

@@ -27,8 +27,8 @@
  * wait_us and wait_result are what the read's wait for a fresh round gave
  * ("none" where no wait was asked). sync_us is always 0 (a column of the
  * first traces, kept so old and new files read alike).
- * Rows are flushed every 256; a killed process loses at most the rows since
- * the last flush and never leaves a partial line before them.
+ * Rows are flushed every 256; a killed process loses what was not yet
+ * written out, and its last line can be cut short (readers drop it).
  */
 #pragma once
 

@@ -13,11 +13,13 @@
 
 #include <array>
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <vector>
 
 #include <rex/input/input_driver.h>
+#include <rex/input/pad_refresher.h>
 #include <rex/input/pad_remap.h>
 
 #include <SDL3/SDL.h>
@@ -108,6 +110,12 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   // never before it).
   std::array<PadRemap, HID_SDL_USER_COUNT> remaps_;
   std::mutex remaps_mutex_;
+  // The fresh read (cvar pad_fresh_read): GetState and GetKeystroke ask it for
+  // a refresh round and wait for that round before they take the events. Set
+  // once on the UI thread when SDL is initialised, before any read; stopped
+  // in OnClosing and kept until the driver is destroyed. Null when the switch
+  // is off.
+  std::unique_ptr<PadRefresher> pad_refresher_;
 };
 
 }  // namespace rex::input::sdl
