@@ -25,6 +25,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/deferred_command_list.h>
+#include <rex/graphics/d3d12/intel_policy.h>
 #include <rex/graphics/d3d12/render_target_cache.h>
 #include <rex/graphics/d3d12/texture_cache.h>
 #include <rex/graphics/flags.h>
@@ -47,6 +48,17 @@ REXCVAR_DEFINE_STRING(render_target_path_d3d12, "", "GPU/D3D12",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 REXCVAR_DEFINE_BOOL(native_stencil_value_output, true, "GPU", "Enable native stencil value output");
+
+// Issue #21 (Intel UHD 770, rtv path): ClearDepthStencilView with a rectangle left the second EDRAM tile with the
+// first tile's depth (the right half of each two-tile frame drawn wrong); drawing the clear fixed it. Intel GPUs
+// draw their depth / stencil resolve clears by default, which lets them use the fast rtv path (intel_policy.h).
+REXCVAR_DEFINE_BOOL(d3d12_clear_depth_via_drawing, false, "GPU/D3D12",
+                    "Draw depth / stencil resolve clears instead of ClearDepthStencilView, on any GPU")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(d3d12_clear_depth_via_drawing_intel, true, "GPU/D3D12",
+                    "Draw depth / stencil resolve clears on Intel GPUs (false: Intel goes back to ROV and "
+                    "ClearDepthStencilView)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace rex::graphics::d3d12 {
 
@@ -174,37 +186,28 @@ bool D3D12RenderTargetCache::Initialize() {
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
 
-  if (REXCVAR_GET(render_target_path_d3d12) == "rtv") {
-    path_ = Path::kHostRenderTargets;
-  } else if (REXCVAR_GET(render_target_path_d3d12) == "rov") {
-    path_ = Path::kPixelShaderInterlock;
-  } else {
-    // As of April 2021 (driver version 27.20.0100.9316), on Intel (tested on
-    // UHD Graphics 630), the "always" stencil comparison function isn't working
-    // properly, so clears in the Xbox 360's Direct3D 9 don't work. Forcing ROV
-    // there.
-#if 1
-    // The ROV path is currently much slower generally.
-    // TODO(Triang3l): Make ROV the default when it's optimized better (for
-    // instance, using static shader modifications to pass render target
-    // parameters).
-    path_ = provider.GetAdapterVendorID() == ui::GraphicsProvider::GpuVendorID::kIntel
-                ? Path::kPixelShaderInterlock
-                : Path::kHostRenderTargets;
-#else
-    // The AMD shader compiler crashes very often with Xenia's custom
-    // output-merger code as of March 2021.
-    path_ = provider.GetAdapterVendorID() == ui::GraphicsProvider::GpuVendorID::kAMD
-                ? Path::kHostRenderTargets
-                : Path::kPixelShaderInterlock;
-#endif
-  }
-  if (path_ == Path::kPixelShaderInterlock && !provider.AreRasterizerOrderedViewsSupported()) {
-    path_ = Path::kHostRenderTargets;
-  }
+  // As of April 2021 (driver version 27.20.0100.9316), on Intel (tested on
+  // UHD Graphics 630), the "always" stencil comparison function isn't working
+  // properly, so clears in the Xbox 360's Direct3D 9 don't work. Forcing ROV
+  // there.
+  // 2026-11-18 (issue #21, UHD 770): the broken clears are ClearDepthStencilView with a rectangle, which leaves the
+  // second tile's depth in place; with the depth / stencil clears drawn, Intel uses the (much faster) rtv path.
+  // The ROV path is currently much slower generally. The choice is intel_policy::ChoosePath.
+  const bool is_intel = provider.GetAdapterVendorID() == ui::GraphicsProvider::GpuVendorID::kIntel;
+  depth_clears_drawn_ = intel_policy::DrawDepthClears(REXCVAR_GET(d3d12_clear_depth_via_drawing),
+                                                      REXCVAR_GET(d3d12_clear_depth_via_drawing_intel), is_intel);
+  path_ = intel_policy::ChoosePath(REXCVAR_GET(render_target_path_d3d12), is_intel,
+                                   provider.AreRasterizerOrderedViewsSupported(), depth_clears_drawn_) ==
+                  intel_policy::Path::kPixelShaderInterlock
+              ? Path::kPixelShaderInterlock
+              : Path::kHostRenderTargets;
   REXGPU_INFO("D3D12 render target path: {} (render_target_path_d3d12 = \"{}\")",
               path_ == Path::kPixelShaderInterlock ? "rov" : "rtv",
               REXCVAR_GET(render_target_path_d3d12));
+  REXGPU_INFO("D3D12 depth clear via drawing: {} (d3d12_clear_depth_via_drawing {}, "
+              "d3d12_clear_depth_via_drawing_intel {}, Intel GPU {})",
+              depth_clears_drawn_ ? "on" : "off", REXCVAR_GET(d3d12_clear_depth_via_drawing) ? "true" : "false",
+              REXCVAR_GET(d3d12_clear_depth_via_drawing_intel) ? "true" : "false", is_intel ? "yes" : "no");
 
   // Create the buffer for reinterpreting EDRAM contents.
   uint32_t edram_buffer_size =
@@ -865,6 +868,55 @@ bool D3D12RenderTargetCache::Initialize() {
       }
     }
 
+    // Depth / stencil clears by drawing (issue #21: Intel GPUs by default, any GPU with
+    // d3d12_clear_depth_via_drawing). Failures are logged and leave a null entry, so the clear falls back to
+    // ClearDepthStencilView.
+    if (depth_clears_drawn_) {
+      D3D12_GRAPHICS_PIPELINE_STATE_DESC depth_clear_pipeline_desc = {};
+      depth_clear_pipeline_desc.pRootSignature = uint32_rtv_clear_root_signature_;
+      depth_clear_pipeline_desc.VS.pShaderBytecode = shaders::fullscreen_cw_vs;
+      depth_clear_pipeline_desc.VS.BytecodeLength = sizeof(shaders::fullscreen_cw_vs);
+      depth_clear_pipeline_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+      depth_clear_pipeline_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+      depth_clear_pipeline_desc.RasterizerState.DepthClipEnable = FALSE;
+      depth_clear_pipeline_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+      depth_clear_pipeline_desc.NumRenderTargets = 0;
+      depth_clear_pipeline_desc.DepthStencilState.DepthEnable = TRUE;
+      depth_clear_pipeline_desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+      depth_clear_pipeline_desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+      depth_clear_pipeline_desc.DepthStencilState.StencilEnable = TRUE;
+      depth_clear_pipeline_desc.DepthStencilState.StencilWriteMask = UINT8_MAX;
+      // EQUAL with a zero read mask, (ref & 0) == (stencil & 0), always passes, without the ALWAYS stencil test
+      // that Intel was reported (2021) to mishandle.
+      depth_clear_pipeline_desc.DepthStencilState.StencilReadMask = 0;
+      depth_clear_pipeline_desc.DepthStencilState.FrontFace.StencilFailOp = D3D12_STENCIL_OP_REPLACE;
+      depth_clear_pipeline_desc.DepthStencilState.FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP_REPLACE;
+      depth_clear_pipeline_desc.DepthStencilState.FrontFace.StencilPassOp = D3D12_STENCIL_OP_REPLACE;
+      depth_clear_pipeline_desc.DepthStencilState.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_EQUAL;
+      depth_clear_pipeline_desc.DepthStencilState.BackFace =
+          depth_clear_pipeline_desc.DepthStencilState.FrontFace;
+      for (size_t i = 0; i < 2; ++i) {
+        xenos::DepthRenderTargetFormat depth_format = i ? xenos::DepthRenderTargetFormat::kD24FS8
+                                                        : xenos::DepthRenderTargetFormat::kD24S8;
+        depth_clear_pipeline_desc.DSVFormat = GetDepthDSVDXGIFormat(depth_format);
+        for (size_t j = size_t(xenos::MsaaSamples::k1X); j <= size_t(xenos::MsaaSamples::k4X); ++j) {
+          if (xenos::MsaaSamples(j) == xenos::MsaaSamples::k2X && !msaa_2x_supported_) {
+            depth_clear_pipeline_desc.SampleMask = 0b1001;
+            depth_clear_pipeline_desc.SampleDesc.Count = 4;
+          } else {
+            depth_clear_pipeline_desc.SampleMask = UINT_MAX;
+            depth_clear_pipeline_desc.SampleDesc.Count = 1 << j;
+          }
+          if (FAILED(device->CreateGraphicsPipelineState(
+                  &depth_clear_pipeline_desc, IID_PPV_ARGS(&depth_clear_draw_pipelines_[i][j])))) {
+            depth_clear_draw_pipelines_[i][j] = nullptr;
+            REXGPU_ERROR("D3D12RenderTargetCache: Failed to create the {} {}-sample depth clearing pipeline",
+                         i ? "D24FS8" : "D24S8", uint32_t(1) << j);
+          }
+        }
+      }
+    }
+
     // FXC-compiled depth / stencil dumping shader is ~2 KB, reserve 4 KB for
     // some additional space.
     built_shader_.reserve(1024);
@@ -971,6 +1023,7 @@ void D3D12RenderTargetCache::Shutdown(bool from_destructor) {
   for (size_t i = 0; i < 2; ++i) {
     for (size_t j = size_t(xenos::MsaaSamples::k1X); j <= size_t(xenos::MsaaSamples::k4X); ++j) {
       ui::d3d12::util::ReleaseAndNull(uint32_rtv_clear_pipelines_[i][j]);
+      ui::d3d12::util::ReleaseAndNull(depth_clear_draw_pipelines_[i][j]);
     }
   }
   ui::d3d12::util::ReleaseAndNull(uint32_rtv_clear_root_signature_);
@@ -4731,11 +4784,45 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
             dest_d3d12_rt.resource(),
             dest_d3d12_rt.SetResourceState(D3D12_RESOURCE_STATE_DEPTH_WRITE),
             D3D12_RESOURCE_STATE_DEPTH_WRITE);
-        command_processor_.SubmitBarriers();
-        command_list.D3DClearDepthStencilView(dest_d3d12_rt.descriptor_draw().GetHandle(),
-                                              D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
-                                              depth_host_clear_value, UINT(clear_value) & 0xFF, 1,
-                                              &clear_rect);
+        ID3D12PipelineState* depth_clear_draw_pipeline =
+            depth_clear_draw_pipelines_[size_t(dest_rt_key.GetDepthFormat() ==
+                                               xenos::DepthRenderTargetFormat::kD24FS8)]
+                                       [size_t(dest_rt_key.msaa_samples)];
+        if (depth_clear_draw_pipeline) {
+          // Drawn depth / stencil clear (issue #21): a full-screen triangle with no pixel shader, the
+          // scissor limiting it to the clear rectangle and the viewport's depth range pinned to the clear value,
+          // so every covered sample gets that depth; the stencil is replaced with the reference value.
+          D3D12_CPU_DESCRIPTOR_HANDLE clear_dsv_handle = dest_d3d12_rt.descriptor_draw().GetHandle();
+          command_list.D3DOMSetRenderTargets(0, nullptr, FALSE, &clear_dsv_handle);
+          // The guest's render targets are no longer bound: the next draw must bind them again.
+          are_current_command_list_render_targets_valid_ = false;
+          D3D12_VIEWPORT clear_viewport;
+          clear_viewport.TopLeftX = float(clear_rect.left);
+          clear_viewport.TopLeftY = float(clear_rect.top);
+          clear_viewport.Width = float(clear_rect.right - clear_rect.left);
+          clear_viewport.Height = float(clear_rect.bottom - clear_rect.top);
+          clear_viewport.MinDepth = depth_host_clear_value;
+          clear_viewport.MaxDepth = depth_host_clear_value;
+          command_processor_.SetViewport(clear_viewport);
+          command_processor_.SetScissorRect(clear_rect);
+          command_processor_.SetStencilReference(UINT(clear_value) & 0xFF);
+          command_processor_.SetExternalGraphicsRootSignature(uint32_rtv_clear_root_signature_);
+          command_processor_.SetExternalPipeline(depth_clear_draw_pipeline);
+          command_processor_.SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+          command_processor_.SubmitBarriers();
+          command_list.D3DDrawInstanced(3, 1, 0, 0);
+          // This draw replaced the transfers' viewport, scissor and root signature: the next render target's
+          // transfers in this loop must set them again (they are cached in the locals above).
+          transfer_viewport_set = false;
+          last_transfer_root_signature_index = TransferRootSignatureIndex::kCount;
+          transfer_root_parameters_set = 0;
+        } else {
+          command_processor_.SubmitBarriers();
+          command_list.D3DClearDepthStencilView(dest_d3d12_rt.descriptor_draw().GetHandle(),
+                                                D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
+                                                depth_host_clear_value, UINT(clear_value) & 0xFF, 1,
+                                                &clear_rect);
+        }
       } else {
         float color_clear_value[4] = {};
         bool clear_via_drawing = false;
@@ -4818,7 +4905,8 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
                   ? dest_d3d12_rt.descriptor_load_separate().GetHandle()
                   : dest_d3d12_rt.descriptor_draw().GetHandle();
           command_list.D3DOMSetRenderTargets(1, &clear_rtv_handle, FALSE, nullptr);
-          are_current_command_list_render_targets_valid_ = true;
+          // The guest's render targets are no longer bound: the next draw must bind them again (was true).
+          are_current_command_list_render_targets_valid_ = false;
           D3D12_VIEWPORT clear_viewport;
           clear_viewport.TopLeftX = float(clear_rect.left);
           clear_viewport.TopLeftY = float(clear_rect.top);
@@ -4837,6 +4925,10 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
               xenos::ColorRenderTargetFormat::k_32_32_FLOAT)][size_t(dest_rt_key.msaa_samples)]);
           command_processor_.SetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
           command_list.D3DDrawInstanced(3, 1, 0, 0);
+          // As after the drawn depth clear: the transfers' cached viewport, scissor and root signature are stale.
+          transfer_viewport_set = false;
+          last_transfer_root_signature_index = TransferRootSignatureIndex::kCount;
+          transfer_root_parameters_set = 0;
         } else {
           command_processor_.SubmitBarriers();
           command_list.D3DClearRenderTargetView(
