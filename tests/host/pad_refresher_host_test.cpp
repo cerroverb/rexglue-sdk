@@ -9,6 +9,7 @@
 
 #include <rex/input/pad_refresher.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -217,29 +218,35 @@ void RecentBoundary() {
 }
 
 // Y asks while round 1 runs: round 1 may hold events from before Y's request only, so Y must get
-// round 2. Y's request is in flight when the gate opens (Y has entered its call 50 ms before).
+// round 2. Y's request has been made when the gate opens (the after_request hook counts requests:
+// X's is the first, Y's the second). Y's own thread counts the rounds ended at the moment its call
+// returns, and every round takes 100 ms from the gate on, so a Y that was answered by round 1 is
+// seen with one round ended.
 void RoundStartsAfterRequest() {
   g_test = "RoundStartsAfterRequest";
   Fake fake;
   fake.hold_round = 1;
-  PadRefresher r(fake.Options());
-  std::atomic<bool> y_entered{false};
+  std::atomic<int> requests{0};
+  PadRefresher::Options o = fake.Options();
+  o.after_request = [&] { ++requests; };
+  PadRefresher r(std::move(o));
   std::future<Result> x = Call(r, kLong);
   CHECK(WaitUntil([&] { return fake.inside.load() && fake.begun == 1; }));
   fake.clock += 2000;
+  std::atomic<int> ended_when_y_returned{-1};
   std::future<Result> y = std::async(std::launch::async, [&] {
-    y_entered = true;
-    return r.RefreshAndWait(kLong);
+    Result result = r.RefreshAndWait(kLong);
+    ended_when_y_returned = fake.ended.load();
+    return result;
   });
-  CHECK(WaitUntil([&] { return y_entered.load(); }));
-  std::this_thread::sleep_for(milliseconds(50));
+  CHECK(WaitUntil([&] { return requests.load() == 2; }));
   CHECK(fake.inside.load() && fake.ended == 0);  // round 1 is still held with both waiting
+  fake.round_ms = 100;
   fake.gate_open = true;
   bool y_ready = AtOnce(y, 5000);
-  int ended_when_y_returned = fake.ended.load();
-  uint64_t rounds_when_y_returned = r.counts().rounds;
+  uint64_t rounds_after_y = r.counts().rounds;
   CHECK(Answer(y, y_ready) == Result::kFresh);
-  CHECK(ended_when_y_returned == 2 && rounds_when_y_returned == 2);
+  CHECK(ended_when_y_returned == 2 && rounds_after_y == 2);
   bool x_ready = AtOnce(x, 5000);
   CHECK(Answer(x, x_ready) == Result::kFresh);
   Release(fake, r);
@@ -501,6 +508,239 @@ void CountsMatch() {
   Release(fake, r);
 }
 
+// A waiting caller keeps its core while the spin lasts: a yield on a busy PC can cost a whole
+// scheduler slice (measured: 13 ms for a round that took 20 us). The spin is 2 s here and the
+// round 20 ms, so the call never reaches a yield whatever the PC's load.
+void SpinKeepsTheCore() {
+  g_test = "SpinKeepsTheCore";
+  Fake fake;
+  fake.round_ms = 20;
+  std::atomic<int> yields{0};
+  PadRefresher::Options o = fake.Options();
+  o.spin_us = 2'000'000;
+  o.yield = [&] {
+    ++yields;
+    std::this_thread::yield();
+  };
+  PadRefresher r(std::move(o));
+  CHECK(r.RefreshAndWait(kLong) == Result::kFresh);
+  CHECK(yields == 0);
+  CHECK(fake.ended == 1);
+  Release(fake, r);
+}
+
+// After the spin the caller gives the core away each turn (a long round must not burn a core for
+// the whole limit), and not before: the first yield comes no earlier than the spin's length.
+void YieldsAfterTheSpin() {
+  g_test = "YieldsAfterTheSpin";
+  Fake fake;
+  fake.round_ms = 100;
+  std::atomic<int> yields{0};
+  std::atomic<int64_t> first_yield_us{-1};
+  std::chrono::steady_clock::time_point start;
+  PadRefresher::Options o = fake.Options();
+  o.spin_us = 5000;
+  o.yield = [&] {
+    if (yields.fetch_add(1) == 0) {
+      first_yield_us = std::chrono::duration_cast<microseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+    }
+    std::this_thread::yield();
+  };
+  PadRefresher r(std::move(o));
+  start = std::chrono::steady_clock::now();
+  CHECK(r.RefreshAndWait(kLong) == Result::kFresh);
+  CHECK(yields > 0);
+  CHECK(first_yield_us >= 5000);
+  Release(fake, r);
+}
+
+// A spin of 0 is the plain yield loop: the first turn that finds the round unfinished yields.
+// Twenty calls, each with a 5 ms round; the earliest first yield of the twenty is taken, so a busy
+// PC must delay every one of them to fail this, while a spin of any length (0 read as a default,
+// say) keeps every first yield at or above that length.
+void NoSpinYieldsAtOnce() {
+  g_test = "NoSpinYieldsAtOnce";
+  Fake fake;
+  fake.round_ms = 5;
+  int yields = 0;           // the hook runs on the calling thread, which is this one
+  int64_t first_yield_us = -1;
+  std::chrono::steady_clock::time_point start;
+  PadRefresher::Options o = fake.Options();
+  o.spin_us = 0;
+  o.yield = [&] {
+    ++yields;
+    if (first_yield_us < 0) {
+      first_yield_us = std::chrono::duration_cast<microseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+    }
+    std::this_thread::yield();
+  };
+  PadRefresher r(std::move(o));
+  int fresh = 0;
+  int64_t earliest = -1;
+  for (int i = 0; i < 20; ++i) {
+    fake.clock += 2000;
+    first_yield_us = -1;
+    start = std::chrono::steady_clock::now();
+    if (r.RefreshAndWait(kLong) == Result::kFresh) ++fresh;
+    if (first_yield_us >= 0 && (earliest < 0 || first_yield_us < earliest)) earliest = first_yield_us;
+  }
+  std::printf("note NoSpinYieldsAtOnce: earliest first yield %lld us, yields %d\n",
+              static_cast<long long>(earliest), yields);
+  CHECK(fresh == 20);
+  CHECK(yields > 0);
+  CHECK(earliest >= 0 && earliest < 150);
+  Release(fake, r);
+}
+
+// The spin is a spin: nothing in it gives the core away or sleeps. The yield hook cannot see a
+// sleep, so this one measures: 51 calls, the refresher's thread asleep before each (1 ms pause),
+// the spin 2 s. A call then lasts as long as the thread's wake and a round (tens of
+// microseconds); a sleep in the spin makes every call that finds its round unfinished at the
+// first look last the sleep's length. The median is judged, so a busy PC must delay half the calls
+// to fail this. Not seen here: a bare yield in the spin on a quiet PC (it returns at once); that
+// is what the runs under made load are for.
+void SpinDoesNotSleep() {
+  g_test = "SpinDoesNotSleep";
+  Fake fake;
+  std::atomic<int> yields{0};
+  PadRefresher::Options o = fake.Options();
+  o.recent_us = 0;
+  o.spin_us = 2'000'000;
+  o.yield = [&] {
+    ++yields;
+    std::this_thread::yield();
+  };
+  PadRefresher r(std::move(o));
+  std::vector<int64_t> us;
+  int fresh = 0;
+  for (int i = 0; i < 51; ++i) {
+    std::this_thread::sleep_for(milliseconds(1));
+    auto t0 = std::chrono::steady_clock::now();
+    if (r.RefreshAndWait(kPlain) == Result::kFresh) ++fresh;
+    us.push_back(
+        std::chrono::duration_cast<microseconds>(std::chrono::steady_clock::now() - t0).count());
+  }
+  std::sort(us.begin(), us.end());
+  std::printf("note SpinDoesNotSleep: call us min %lld, median %lld, max %lld\n",
+              static_cast<long long>(us[0]), static_cast<long long>(us[25]),
+              static_cast<long long>(us[50]));
+  CHECK(fresh == 51);
+  CHECK(yields == 0);
+  CHECK(us[25] < 500);
+  Release(fake, r);
+}
+
+// Whether rounds are slow is read BEFORE a call makes its request. Rounds are slow (one call ran
+// out); then rounds are quick, and the call's own round has ended, and cleared "slow", before the
+// call goes on (the after_request hook waits for round 2). The call must not wait for a round
+// because that round was quick: it answers kSkipped. Read after the request, "slow" is already
+// clear and the answer is kFresh.
+void SlowIsReadBeforeTheRequest() {
+  g_test = "SlowIsReadBeforeTheRequest";
+  Fake fake;
+  fake.round_ms = 100;
+  std::atomic<bool> armed{false};
+  std::atomic<bool> saw_round_2{false};
+  std::atomic<PadRefresher*> rp{nullptr};
+  PadRefresher::Options o = fake.Options();
+  // Round 2 is seen by its end stamp (7000 on the test's clock; round 1's is 5000), which the
+  // thread stores after it cleared "slow". Not by counts(): the hook must use nothing a caller
+  // could be holding.
+  o.after_request = [&] {
+    if (!armed.load()) return;
+    saw_round_2 = WaitUntil([&] { return rp.load()->last_round_end_us() == 7000; });
+  };
+  PadRefresher r(std::move(o));
+  rp = &r;
+  CHECK(r.RefreshAndWait(milliseconds(40)) == Result::kTimedOut);
+  CHECK(WaitUntil([&] { return r.counts().rounds >= 1; }));
+  fake.round_ms = 0;
+  fake.clock += 2000;
+  armed = true;
+  Result result = r.RefreshAndWait(kPlain);
+  armed = false;
+  CHECK(saw_round_2);
+  CHECK(result == Result::kSkipped);
+  Release(fake, r);
+}
+
+// A request made while the refresher's thread is between "nothing to do" and going to sleep is
+// not slept through. The after_noted hook holds the thread right after its first read of the
+// request count (0: nothing to do) until the caller's request has been made. The thread read its
+// wake word before that, so its sleep returns at once and the round runs; had it read the wake
+// word after the request count, it would sleep on the new value and the caller would pay its
+// whole limit.
+void RequestBeforeTheSleepIsSeen() {
+  g_test = "RequestBeforeTheSleepIsSeen";
+  Fake fake;
+  std::atomic<int> noted_calls{0};
+  std::atomic<bool> at_hook{false};
+  std::atomic<bool> requested{false};
+  std::atomic<bool> hook_gave_up{false};
+  PadRefresher::Options o = fake.Options();
+  o.after_noted = [&] {
+    if (noted_calls.fetch_add(1) != 0) return;  // the first look only
+    at_hook = true;
+    auto give_up = std::chrono::steady_clock::now() + seconds(30);
+    while (!requested.load()) {
+      if (std::chrono::steady_clock::now() > give_up) {
+        hook_gave_up = true;
+        break;
+      }
+      std::this_thread::sleep_for(milliseconds(1));
+    }
+  };
+  o.after_request = [&] { requested = true; };
+  PadRefresher r(std::move(o));
+  CHECK(WaitUntil([&] { return at_hook.load(); }));
+  CHECK(fake.begun == 0);
+  CHECK(r.RefreshAndWait(kPlain) == Result::kFresh);
+  CHECK(!hook_gave_up && fake.ended == 1);
+  Release(fake, r);
+}
+
+// A caller that stops for ever right after it made its request (at a window close the guest
+// threads are killed wherever they are) holds nothing the others need: counts() answers, the
+// round it asked for runs and Stop() returns. A guard, not a proof: only the one place where
+// `after_request` runs is covered; the mutant that puts a lock around the request shows the test
+// can fail.
+void StuckCallerBlocksNobody() {
+  g_test = "StuckCallerBlocksNobody";
+  Fake fake;
+  std::atomic<bool> entered{false};
+  std::atomic<bool> release{false};
+  PadRefresher::Options o = fake.Options();
+  o.after_request = [&] {
+    entered = true;
+    auto give_up = std::chrono::steady_clock::now() + seconds(30);
+    while (!release.load() && std::chrono::steady_clock::now() < give_up) {
+      std::this_thread::sleep_for(milliseconds(1));
+    }
+  };
+  PadRefresher r(std::move(o));
+  std::future<Result> a = Call(r, kLong);
+  bool a_entered = WaitUntil([&] { return entered.load(); });
+  CHECK(a_entered);
+  std::future<uint64_t> c = std::async(std::launch::async, [&] { return r.counts().fresh; });
+  bool c_ready = AtOnce(c);
+  CHECK(c_ready);
+  CHECK(WaitUntil([&] { return fake.ended.load() >= 1; }));
+  std::future<void> s = std::async(std::launch::async, [&] { r.Stop(); });
+  bool s_ready = AtOnce(s);
+  CHECK(s_ready);
+  bool stuck_until_now = a.wait_for(milliseconds(0)) != std::future_status::ready;
+  CHECK(stuck_until_now);
+  release = true;
+  bool a_ready = AtOnce(a);
+  CHECK(a_ready);
+  CHECK(Answer(a, a_ready) == Result::kFresh);  // its round had ended: done comes before stopped
+  Release(fake, r);
+}
+
 }  // namespace
 
 int main() {
@@ -519,6 +759,13 @@ int main() {
   NotStartedReturnsAtOnce();
   DefaultClockStampsRounds();
   CountsMatch();
+  SpinKeepsTheCore();
+  YieldsAfterTheSpin();
+  NoSpinYieldsAtOnce();
+  SpinDoesNotSleep();
+  SlowIsReadBeforeTheRequest();
+  RequestBeforeTheSleepIsSeen();
+  StuckCallerBlocksNobody();
   if (g_failures) {
     std::printf("pad_refresher: FAILED\n");
   } else {

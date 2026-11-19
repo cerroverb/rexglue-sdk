@@ -13,7 +13,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -45,6 +44,16 @@ class PadRefresher {
     std::function<void()> thread_setup;  // optional; runs once on that thread before the first wait
     std::function<int64_t()> now_us;     // optional; default steady_clock in microseconds; stamps rounds
     int64_t recent_us = 1000;
+    // A waiting caller keeps its core this long before it starts to yield it
+    // between looks. A round takes tens of microseconds; a yield on a busy PC
+    // can cost a whole scheduler slice (measured: 13 ms).
+    int64_t spin_us = 300;
+    std::function<void()> yield;          // optional; default std::this_thread::yield (tests count it)
+    std::function<void()> after_request;  // optional, for tests: runs on the caller's thread right
+                                          // after its request is made, before it waits
+    std::function<void()> after_noted;    // optional, for tests: runs on the refresher's thread right
+                                          // after it read the request count, before it sleeps or
+                                          // runs a round
     bool start_thread = true;            // false: behaves as a refresher whose thread could not start
   };
 
@@ -73,6 +82,14 @@ class PadRefresher {
   // Waiters leave at once and later calls return kStopped; then the thread
   // is joined (a round in flight is waited for). Idempotent; from any thread
   // but the refresher's own.
+  //
+  // No call takes a lock of this class or of the C++ library that another
+  // thread could need: RefreshAndWait and counts() take none, and Stop() takes
+  // only the one that orders two Stop() calls. So a caller's thread that is
+  // killed inside RefreshAndWait (the guest threads are, at a window close)
+  // leaves no lock of ours held. Not covered: whatever the OS's own wake call
+  // holds for an instant, and any lock the refresh function takes (Stop()
+  // waits for a round in flight).
   void Stop();
 
   Counts counts() const;
@@ -91,11 +108,13 @@ class PadRefresher {
   std::atomic<bool> stopped_{false};
 
   // Request numbers start at 1. A request is done when a round that began
-  // after it was made has ended.
-  mutable std::mutex mutex_;  // requested_, and the publication of a round's end
-  std::condition_variable wake_;
+  // after it was made has ended. A round's end is published in this order:
+  // the two stamps, rounds_, then done_.
   std::atomic<uint64_t> requested_{0};
   std::atomic<uint64_t> done_{0};
+  // The thread sleeps on this (std::atomic wait); every request and Stop()
+  // change it and notify. 32 bits: the size the OS waits on directly.
+  std::atomic<uint32_t> wake_{0};
   // Set when a caller's wait runs out, with that caller's limit; while it is
   // set nobody waits. The thread clears it after a round that took less than
   // half that limit.
