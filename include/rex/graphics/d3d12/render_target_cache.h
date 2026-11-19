@@ -751,6 +751,14 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   ID3D12RootSignature* uint32_rtv_clear_root_signature_ = nullptr;
   // [32 or 32_32][MSAA samples].
   ID3D12PipelineState* uint32_rtv_clear_pipelines_[2][size_t(xenos::MsaaSamples::k4X) + 1] = {};
+  // Issue #21: depth / stencil resolve clears drawn as a full-screen triangle instead of ClearDepthStencilView
+  // (intel_policy::DrawDepthClears: Intel GPUs by default, any GPU with d3d12_clear_depth_via_drawing). Set in
+  // Initialize before the path is chosen.
+  bool depth_clears_drawn_ = false;
+  // The drawn clear's pipelines (no pixel shader, the viewport's depth range pinned to the clear value),
+  // [D24S8, D24FS8][samples], created only when depth_clears_drawn_. A null entry falls back to
+  // ClearDepthStencilView.
+  ID3D12PipelineState* depth_clear_draw_pipelines_[2][size_t(xenos::MsaaSamples::k4X) + 1] = {};
 
   std::vector<Transfer> clear_transfers_[2];
 
