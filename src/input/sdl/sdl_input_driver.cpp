@@ -55,12 +55,6 @@ static constexpr std::array<std::string_view, HID_SDL_USER_COUNT> kPadRemapCvars
 
 // The fresh read: how long a read waits for its refresh round.
 static constexpr std::chrono::milliseconds kPadFreshWaitLimit(2);
-// A session whose MEAN round is longer than this gets one WARN at close: every frame's
-// first read waits for its round. A single long round is normal (SDL's battery query
-// takes about 4 ms now and then, device detection after an unplug about 200 ms), so
-// the longest round alone is only reported, never warned about.
-static constexpr int64_t kPadLongMeanRoundUs = 500;
-static constexpr uint64_t kPadLongMeanMinRounds = 1000;
 
 static const char* PadWaitResultName(PadRefresher::Result result) {
   switch (result) {
@@ -256,18 +250,18 @@ void SDLInputDriver::OnClosing(rex::ui::UIEvent&) {
     // into SDL. The object stays, so a read that comes later returns at once.
     if (pad_refresher_) {
       const PadRefresher::Counts counts = pad_refresher_->counts();
-      const int64_t mean_round_us =
-          counts.rounds ? counts.round_us_sum / static_cast<int64_t>(counts.rounds) : 0;
+      // The mean and the WARN rule: PadRefresher::RoundCostOf (host-tested).
+      const PadRefresher::RoundCost round_cost = PadRefresher::RoundCostOf(counts);
       REXLOG_INFO(
           "SDL pad fresh read: {} fresh, {} recent, {} timed out, {} skipped, {} rounds, longest "
           "round {} us, mean {} us, longest start delay {} us",
           counts.fresh, counts.recent, counts.timed_out, counts.skipped, counts.rounds,
-          counts.longest_round_us, mean_round_us, counts.longest_start_delay_us);
-      if (counts.rounds >= kPadLongMeanMinRounds && mean_round_us > kPadLongMeanRoundUs) {
+          counts.longest_round_us, round_cost.mean_us, counts.longest_start_delay_us);
+      if (round_cost.warn) {
         REXLOG_WARN(
             "SDL pad fresh read: pad refresh rounds took {} us on average; the game thread waits "
             "that long for the pad every frame",
-            mean_round_us);
+            round_cost.mean_us);
       }
       pad_refresher_->Stop();
       REXLOG_INFO("SDL pad fresh read: pad thread stopped");

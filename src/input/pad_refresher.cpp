@@ -218,6 +218,15 @@ PadRefresher::Counts PadRefresher::counts() const {
   return c;
 }
 
+PadRefresher::RoundCost PadRefresher::RoundCostOf(const Counts& counts) {
+  RoundCost cost{0, false};
+  if (counts.rounds) {
+    cost.mean_us = counts.round_us_sum / static_cast<int64_t>(counts.rounds);
+  }
+  cost.warn = counts.rounds >= kLongMeanMinRounds && cost.mean_us > kLongMeanRoundUs;
+  return cost;
+}
+
 int64_t PadRefresher::longest_round_us() const {
   return longest_round_us_.load(std::memory_order_acquire);
 }

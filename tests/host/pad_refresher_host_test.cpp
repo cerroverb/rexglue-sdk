@@ -950,9 +950,47 @@ void StuckCallerBlocksNobody() {
   Release(fake, r);
 }
 
+// The closing line's round cost and its WARN (review 7 R3): a pure function of the counts, so
+// the driver's one comparison is pinned here. The limits are written as literals (1000 rounds,
+// 500 us), not taken from the constants under test. Each fixture's longest round differs from
+// its mean and its sum, so a function that judged either of those gives another answer.
+void RoundCostSummary() {
+  g_test = "RoundCostSummary";
+  auto of = [](uint64_t rounds, int64_t sum_us, int64_t longest_us) {
+    PadRefresher::Counts c{};
+    c.rounds = rounds;
+    c.round_us_sum = sum_us;
+    c.longest_round_us = longest_us;
+    return PadRefresher::RoundCostOf(c);
+  };
+  // 1000 rounds with a mean of 501 us: the first session that warns.
+  PadRefresher::RoundCost at_both = of(1000, 501000, 7);
+  CHECK(at_both.mean_us == 501 && at_both.warn);
+  // 999 rounds with the same mean (999 * 501 = 500499): one round short, no warning.
+  PadRefresher::RoundCost short_session = of(999, 500499, 7);
+  CHECK(short_session.mean_us == 501 && !short_session.warn);
+  // 1000 rounds with a mean of exactly 500 us: at the limit, NOT over it.
+  PadRefresher::RoundCost at_limit = of(1000, 500000, 7);
+  CHECK(at_limit.mean_us == 500 && !at_limit.warn);
+  // The mean rounds down: 500.999 us is 500, no warning.
+  PadRefresher::RoundCost rounds_down = of(1000, 500999, 7);
+  CHECK(rounds_down.mean_us == 500 && !rounds_down.warn);
+  // One very long round in a quick session (the shape of a real run with pads being added:
+  // 4463 rounds, 194 us mean, longest 207116 us): reported by the caller, never warned about.
+  PadRefresher::RoundCost one_long = of(4463, 865822, 207116);
+  CHECK(one_long.mean_us == 194 && !one_long.warn);
+  // No round at all: no division, mean 0, no warning.
+  PadRefresher::RoundCost none = of(0, 0, 0);
+  CHECK(none.mean_us == 0 && !none.warn);
+  // A long session of slow rounds: the sum is past 32 bits (3,000,000 rounds of 4000 us).
+  PadRefresher::RoundCost long_session = of(3000000, 12000000000LL, 9000);
+  CHECK(long_session.mean_us == 4000 && long_session.warn);
+}
+
 }  // namespace
 
 int main() {
+  RoundCostSummary();
   NeverOnCallerThread();
   ThreadSetupRunsOnceOnPadThread();
   BurstGetsOneRound();

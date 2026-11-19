@@ -44,6 +44,20 @@ class PadRefresher {
                                      // round that served it (the newest request it served)
   };
 
+  // What a session's closing line says about the cost of its rounds. A session whose
+  // MEAN round is longer than kLongMeanRoundUs gets one WARN at close, once at least
+  // kLongMeanMinRounds rounds ran: every frame's first read waits for its round. A
+  // single long round is normal (SDL's battery query takes about 4 ms now and then,
+  // device detection after an unplug about 200 ms), so the longest round is reported
+  // and never warned about.
+  static constexpr int64_t kLongMeanRoundUs = 500;
+  static constexpr uint64_t kLongMeanMinRounds = 1000;
+  struct RoundCost {
+    int64_t mean_us;  // round_us_sum / rounds, rounded down; 0 when no round ran
+    bool warn;        // rounds >= kLongMeanMinRounds and mean_us > kLongMeanRoundUs
+  };
+  static RoundCost RoundCostOf(const Counts& counts);
+
   struct Options {
     std::function<void()> refresh;       // one round; runs on the refresher's thread only
     std::function<void()> thread_setup;  // optional; runs once on that thread before the first wait
