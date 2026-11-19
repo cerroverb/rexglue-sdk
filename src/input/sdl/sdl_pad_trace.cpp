@@ -6,20 +6,24 @@
 
 #include <atomic>
 #include <chrono>
-#include <cstdio>
+#include <cstddef>
 #include <cstdlib>
 #include <functional>
-#include <mutex>
 #include <string>
 #include <thread>
 
+#include <rex/logging.h>
+
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
 #include <process.h>
 #else
+#include <fcntl.h>
 #include <unistd.h>
 #endif
-
-#include <rex/logging.h>
 
 namespace rex::input::sdl::padtrace {
 
@@ -43,11 +47,67 @@ long long ProcessId() {
 #endif
 }
 
+// One CSV line, built on the writer's stack: no lock, no allocation, no C
+// library stream or locale. A guest thread can be killed in the middle of a
+// row (at a window close), and it must leave nothing held.
+class Line {
+ public:
+  void Text(const char* s) {
+    while (*s) {
+      Char(*s++);
+    }
+  }
+  void Char(char c) {
+    if (n_ < sizeof(buf_) - 1) {  // the last byte is kept for the line's end
+      buf_[n_++] = c;
+    }
+  }
+  void Unsigned(uint64_t v) {
+    char digits[20];
+    int k = 0;
+    do {
+      digits[k++] = static_cast<char>('0' + v % 10);
+      v /= 10;
+    } while (v != 0);
+    while (k > 0) {
+      Char(digits[--k]);
+    }
+  }
+  void Signed(int64_t v) {
+    if (v < 0) {
+      Char('-');
+      Unsigned(0 - static_cast<uint64_t>(v));
+    } else {
+      Unsigned(static_cast<uint64_t>(v));
+    }
+  }
+  // Ends the line; returns its length with the line's end.
+  size_t End() {
+    buf_[n_++] = '\n';
+    return n_;
+  }
+  const char* data() const { return buf_; }
+
+ private:
+  char buf_[1024];
+  size_t n_ = 0;
+};
+
+constexpr char kHeader[] =
+    "seq,site,user,tid,active,queued_before,t_enter_us,t_copy_us,sync_us,pumps,queue_us,"
+    "pump_begin_us,pump_end_us,pump_tid,events,events_outside,last_event_us,result,caller,"
+    "wait_us,wait_result,rounds,round_begin_us,round_end_us,in_round\n";
+
 struct Trace {
   bool on = false;
-  std::FILE* file = nullptr;
-  std::mutex mu;  // the file and `rows`
-  uint64_t rows = 0;
+  // Opened for append: each write lands whole at the file's end, so rows of
+  // different threads never mix inside a line, with no lock of ours.
+#if defined(_WIN32)
+  HANDLE file = INVALID_HANDLE_VALUE;
+#else
+  int file = -1;
+#endif
+  std::atomic<uint64_t> rows{0};
   std::atomic<int64_t> queue_us{0}, pump_begin_us{0}, pump_end_us{0}, last_event_us{0};
   std::atomic<int64_t> round_begin_us{0}, round_end_us{0};
   std::atomic<uint64_t> pumps{0}, rounds{0}, events{0}, events_outside{0};
@@ -60,18 +120,37 @@ struct Trace {
       return;
     }
     const std::string path = std::string(dir) + "/padage_" + std::to_string(ProcessId()) + ".csv";
-    file = std::fopen(path.c_str(), "w");
-    if (!file) {
+#if defined(_WIN32)
+    // Created (or emptied) first, then opened again with append access only.
+    HANDLE created = CreateFileA(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                 nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (created != INVALID_HANDLE_VALUE) {
+      CloseHandle(created);
+      file = CreateFileA(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    }
+    const bool opened = file != INVALID_HANDLE_VALUE;
+#else
+    file = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);
+    const bool opened = file >= 0;
+#endif
+    if (!opened) {
       REXLOG_ERROR("padage: cannot open {}", path);
       return;
     }
-    std::fputs("seq,site,user,tid,active,queued_before,t_enter_us,t_copy_us,sync_us,pumps,queue_us,"
-               "pump_begin_us,pump_end_us,pump_tid,events,events_outside,last_event_us,result,caller,"
-               "wait_us,wait_result,rounds,round_begin_us,round_end_us,in_round\n",
-               file);
-    std::fflush(file);
+    Write(kHeader, sizeof(kHeader) - 1);
     on = true;
     REXLOG_INFO("padage: trace on, file {}", path);
+  }
+
+  // One write call for the whole line.
+  void Write(const char* data, size_t size) {
+#if defined(_WIN32)
+    DWORD written = 0;
+    WriteFile(file, data, static_cast<DWORD>(size), &written, nullptr);
+#else
+    (void)!::write(file, data, size);
+#endif
   }
 };
 
@@ -191,21 +270,57 @@ Sample::~Sample() {
     return;
   }
   Trace& t = T();
-  std::lock_guard<std::mutex> lock(t.mu);
-  std::fprintf(t.file,
-               "%llu,%s,%u,%u,%d,%d,%lld,%lld,0,%llu,%lld,%lld,%lld,%u,%llu,%llu,%lld,%u,%s,%lld,%s,%llu,"
-               "%lld,%lld,%d\n",
-               static_cast<unsigned long long>(t.rows), site_, user_, Tid(), active ? 1 : 0,
-               queued_before ? 1 : 0, static_cast<long long>(t_enter_), static_cast<long long>(t_copy_),
-               static_cast<unsigned long long>(pumps_), static_cast<long long>(queue_us_),
-               static_cast<long long>(pump_begin_), static_cast<long long>(pump_end_), pump_tid_,
-               static_cast<unsigned long long>(events_), static_cast<unsigned long long>(events_outside_),
-               static_cast<long long>(last_event_), result, caller_, static_cast<long long>(wait_us_),
-               wait_result_, static_cast<unsigned long long>(rounds_), static_cast<long long>(round_begin_),
-               static_cast<long long>(round_end_), in_round_ ? 1 : 0);
-  if ((++t.rows & 255) == 0) {
-    std::fflush(t.file);
-  }
+  // The columns of kHeader, in its order.
+  Line line;
+  line.Unsigned(t.rows.fetch_add(1));
+  line.Char(',');
+  line.Text(site_);
+  line.Char(',');
+  line.Unsigned(user_);
+  line.Char(',');
+  line.Unsigned(Tid());
+  line.Char(',');
+  line.Unsigned(active ? 1 : 0);
+  line.Char(',');
+  line.Unsigned(queued_before ? 1 : 0);
+  line.Char(',');
+  line.Signed(t_enter_);
+  line.Char(',');
+  line.Signed(t_copy_);
+  line.Text(",0,");  // sync_us
+  line.Unsigned(pumps_);
+  line.Char(',');
+  line.Signed(queue_us_);
+  line.Char(',');
+  line.Signed(pump_begin_);
+  line.Char(',');
+  line.Signed(pump_end_);
+  line.Char(',');
+  line.Unsigned(pump_tid_);
+  line.Char(',');
+  line.Unsigned(events_);
+  line.Char(',');
+  line.Unsigned(events_outside_);
+  line.Char(',');
+  line.Signed(last_event_);
+  line.Char(',');
+  line.Unsigned(result);
+  line.Char(',');
+  line.Text(caller_);
+  line.Char(',');
+  line.Signed(wait_us_);
+  line.Char(',');
+  line.Text(wait_result_);
+  line.Char(',');
+  line.Unsigned(rounds_);
+  line.Char(',');
+  line.Signed(round_begin_);
+  line.Char(',');
+  line.Signed(round_end_);
+  line.Char(',');
+  line.Unsigned(in_round_ ? 1 : 0);
+  const size_t size = line.End();
+  t.Write(line.data(), size);
 }
 
 }  // namespace rex::input::sdl::padtrace

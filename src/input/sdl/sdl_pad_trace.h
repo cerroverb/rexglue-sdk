@@ -27,8 +27,11 @@
  * wait_us and wait_result are what the read's wait for a fresh round gave
  * ("none" where no wait was asked). sync_us is always 0 (a column of the
  * first traces, kept so old and new files read alike).
- * Rows are flushed every 256; a killed process loses what was not yet
- * written out, and its last line can be cut short (readers drop it).
+ * Each row is formatted on the writer's stack and written with one write
+ * call on a file opened for append, with no lock (a guest thread can be
+ * killed in the middle of a row and must leave nothing held): rows of
+ * different threads can come out of seq order but never mix inside a line.
+ * A killed process's last line can be cut short (readers drop it).
  */
 #pragma once
 
