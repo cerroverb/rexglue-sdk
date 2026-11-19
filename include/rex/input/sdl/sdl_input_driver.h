@@ -87,7 +87,8 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   ControllerState* GetControllerState(uint32_t user_index);
   bool TestSDLVersion() const;
   void UpdateXCapabilities(ControllerState& state);
-  void QueueControllerUpdate();
+  // `caller` names the requesting function in the diagnostic trace (sdl_pad_trace.h).
+  void QueueControllerUpdate(const char* caller);
   // Parses pad_remap_p<slot + 1>; called at Setup and from the cvar's change
   // callback (which runs under the cvar registry lock: no cvar calls here).
   void LoadPadRemap(size_t slot, std::string_view text);

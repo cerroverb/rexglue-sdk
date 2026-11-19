@@ -20,6 +20,8 @@
 #include <rex/logging.h>
 #include <rex/ui/virtual_key.h>
 
+#include "sdl_pad_trace.h"
+
 REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
 
@@ -189,7 +191,7 @@ X_RESULT SDLInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
     return X_ERROR_BAD_ARGUMENTS;
   }
 
-  QueueControllerUpdate();
+  QueueControllerUpdate("caps");
 
   auto guard = DrainAndLock();
 
@@ -215,14 +217,20 @@ X_RESULT SDLInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
 
   auto is_active = this->is_active();
 
+  // Diagnostic row (sdl_pad_trace.h); written at scope exit, after `guard` is released.
+  padtrace::Sample trace_row("state", user_index, "state");
+  trace_row.active = is_active;
+  trace_row.queued_before = sdl_pumpevents_queued_.load();
   if (is_active) {
-    QueueControllerUpdate();
+    QueueControllerUpdate("state");
   }
+  trace_row.Snapshot();
 
   auto guard = DrainAndLock();
 
   auto controller = GetControllerState(user_index);
   if (!controller) {
+    trace_row.result = X_ERROR_DEVICE_NOT_CONNECTED;
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
@@ -253,7 +261,7 @@ X_RESULT SDLInputDriver::GetRawState(uint32_t user_index, X_INPUT_STATE* out_sta
   }
   // Keep the state fresh while the driver is inactive (GetState only queues
   // an update when active).
-  QueueControllerUpdate();
+  QueueControllerUpdate("raw");
   // The caller is the UI thread. It must not wait for controllers_mutex_: a
   // guest thread can hold it inside SDL_OpenGamepad (a pad plugged in), and
   // SDL may need the UI thread's message loop to finish that. Report busy
@@ -286,7 +294,7 @@ X_RESULT SDLInputDriver::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibrat
     return X_ERROR_BAD_ARGUMENTS;
   }
 
-  QueueControllerUpdate();
+  QueueControllerUpdate("set");
 
   auto guard = DrainAndLock();
 
@@ -366,9 +374,14 @@ X_RESULT SDLInputDriver::GetKeystroke(uint32_t users, uint32_t flags,
 
   auto is_active = this->is_active();
 
+  // Diagnostic row (sdl_pad_trace.h); written at scope exit, after `guard` is released.
+  padtrace::Sample trace_row("key", users, "key");
+  trace_row.active = is_active;
+  trace_row.queued_before = sdl_pumpevents_queued_.load();
   if (is_active) {
-    QueueControllerUpdate();
+    QueueControllerUpdate("key");
   }
+  trace_row.Snapshot();
 
   auto guard = DrainAndLock();
 
@@ -471,6 +484,8 @@ void SDLInputDriver::HandleEvent(const SDL_Event& event) {
     SDL_FlushEvents(SDL_EVENT_JOYSTICK_AXIS_MOTION, SDL_EVENT_FINGER_DOWN - 1);
     sdl_events_unflushed_ = 0;
   }
+
+  padtrace::Event(static_cast<uint32_t>(event.type), event.common.timestamp);
 
   // Buffer only - no controllers_mutex_ acquisition here.
   // This breaks the lock ordering inversion between controllers_mutex_ and
@@ -747,13 +762,20 @@ void SDLInputDriver::UpdateXCapabilities(ControllerState& state) {
   c.vibration.right_motor_speed = 0xFFFFu;
 }
 
-void SDLInputDriver::QueueControllerUpdate() {
+void SDLInputDriver::QueueControllerUpdate(const char* caller) {
   // Pump SDL events to ensure controller state is up to date.
   bool is_queued = false;
   sdl_pumpevents_queued_.compare_exchange_strong(is_queued, true);
+  padtrace::Sample trace_row("queue", 0, caller);  // every caller's request, queued or not
+  trace_row.active = true;
+  trace_row.queued_before = is_queued;
+  trace_row.Snapshot();
   if (!is_queued) {
+    trace_row.MarkQueued();
     attached_window_->app_context().CallInUIThread([this]() {
+      padtrace::PumpBegin();
       SDL_PumpEvents();
+      padtrace::PumpEnd();
       sdl_pumpevents_queued_ = false;
     });
   }
