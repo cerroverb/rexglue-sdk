@@ -37,6 +37,11 @@ class PadRefresher {
     uint64_t timed_out;
     uint64_t skipped;
     uint64_t stopped;
+    // What rounds cost, on steady_clock in microseconds (0 before the first round).
+    int64_t longest_round_us;        // the longest refresh call
+    int64_t round_us_sum;            // all refresh calls together (mean = this / rounds)
+    int64_t longest_start_delay_us;  // the longest time from a request to the start of the
+                                     // round that served it (the newest request it served)
   };
 
   struct Options {
@@ -54,7 +59,10 @@ class PadRefresher {
     std::function<void()> after_noted;    // optional, for tests: runs on the refresher's thread right
                                           // after it read the request count, before it sleeps or
                                           // runs a round
-    bool start_thread = true;            // false: behaves as a refresher whose thread could not start
+    std::function<void()> at_deadline;    // optional, for tests: runs on the caller's thread when
+                                          // its wait has reached the limit, before its last look
+                                          // at whether its round has ended
+    bool start_thread = true;           // false: behaves as a refresher whose thread could not start
   };
 
   explicit PadRefresher(Options options);
@@ -71,8 +79,9 @@ class PadRefresher {
   //
   // When a wait runs out, rounds count as slow: that caller gets kTimedOut,
   // callers waiting beside it and later callers get kSkipped without a wait
-  // (each still asks for a round), until a round has taken less than half
-  // that limit. So slow rounds cost one limit, not one a call.
+  // (each still asks for a round), until a round has ended less than half
+  // that limit after the request of a skipped call it served. So slow rounds,
+  // and rounds that start late, cost one limit, not one a call.
   //
   // The object must outlive every call: destroy it only when no thread can
   // still be inside RefreshAndWait (Stop() makes calls return, it does not
@@ -93,6 +102,9 @@ class PadRefresher {
   void Stop();
 
   Counts counts() const;
+  // Counts::longest_round_us alone (one load). No caller in the driver: the driver reports
+  // the round costs once, at close, from counts().
+  int64_t longest_round_us() const;
   // 0 before the first round; on the now_us clock. Two separate reads: while
   // rounds run, a begin and an end read one after the other can belong to
   // different rounds.
@@ -102,6 +114,7 @@ class PadRefresher {
  private:
   void ThreadMain();
   int64_t NowUs() const;
+  static int64_t SteadyUs();  // steady_clock in microseconds, whatever now_us is
 
   Options options_;
   bool started_ = false;  // set in the constructor only
@@ -116,14 +129,26 @@ class PadRefresher {
   // change it and notify. 32 bits: the size the OS waits on directly.
   std::atomic<uint32_t> wake_{0};
   // Set when a caller's wait runs out, with that caller's limit; while it is
-  // set nobody waits. The thread clears it after a round that took less than
-  // half that limit.
+  // set nobody waits. A call that finds it set stores its request time in
+  // slow_request_us_ before it makes the request; the thread clears slow_
+  // after a round that ended less than half that limit after the stamp it
+  // read with the round's request count. The caller's clock, not the round's
+  // own duration: the thread cannot see how late it was woken.
   std::atomic<bool> slow_{false};
   std::atomic<int64_t> slow_limit_us_{0};
+  std::atomic<int64_t> slow_request_us_{0};  // steady_clock us; 0 = none yet
+
+  // Every request's time (steady_clock us), stored before the request is
+  // made; the thread reads it with the request count, for the start delay.
+  std::atomic<int64_t> request_us_{0};
 
   std::atomic<uint64_t> rounds_{0};
   std::atomic<int64_t> last_begin_us_{0};
   std::atomic<int64_t> last_end_us_{0};
+  // Round costs; written by the thread only.
+  std::atomic<int64_t> longest_round_us_{0};
+  std::atomic<int64_t> round_us_sum_{0};
+  std::atomic<int64_t> longest_start_delay_us_{0};
 
   std::atomic<uint64_t> fresh_{0};
   std::atomic<uint64_t> recent_{0};

@@ -34,13 +34,17 @@ bool PadRefresher::running() const {
   return started_ && !stopped_.load(std::memory_order_acquire);
 }
 
+int64_t PadRefresher::SteadyUs() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
 int64_t PadRefresher::NowUs() const {
   if (options_.now_us) {
     return options_.now_us();
   }
-  return std::chrono::duration_cast<std::chrono::microseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
-      .count();
+  return SteadyUs();
 }
 
 PadRefresher::Result PadRefresher::RefreshAndWait(std::chrono::microseconds limit) {
@@ -59,6 +63,13 @@ PadRefresher::Result PadRefresher::RefreshAndWait(std::chrono::microseconds limi
   // Whether rounds are slow is read before the request is made: the round
   // this call asks for must not decide whether this call waits for it.
   const bool slow = slow_.load(std::memory_order_acquire);
+  // The request's time, stored before the request is made, so a round that
+  // counts this request reads this time or a later one (see ThreadMain).
+  const int64_t asked_us = SteadyUs();
+  request_us_.store(asked_us);
+  if (slow) {
+    slow_request_us_.store(asked_us);
+  }
   const uint64_t mine = requested_.fetch_add(1) + 1;
   wake_.fetch_add(1);
   wake_.notify_one();
@@ -99,6 +110,15 @@ PadRefresher::Result PadRefresher::RefreshAndWait(std::chrono::microseconds limi
     }
     const auto now = std::chrono::steady_clock::now();
     if (now >= deadline) {
+      if (options_.at_deadline) {
+        options_.at_deadline();
+      }
+      // One more look: this thread can lose its core between its look above
+      // and the clock read, and its round can end meanwhile.
+      if (done_.load(std::memory_order_acquire) >= mine) {
+        ++fresh_;
+        return Result::kFresh;
+      }
       slow_limit_us_.store(limit.count(), std::memory_order_release);
       slow_.store(true, std::memory_order_release);
       ++timed_out_;
@@ -129,6 +149,11 @@ void PadRefresher::ThreadMain() {
     // Requests made from here on are not served by this round: it may
     // already have read the device when they arrive.
     const uint64_t noted = requested_.load();
+    // Request times, read after the count: each request counted in `noted`
+    // stored its time before it was counted, so these are the newest such
+    // request's or a later one's.
+    const int64_t asked_us = request_us_.load();
+    const int64_t asked_slow_us = slow_request_us_.load();
     if (options_.after_noted) {
       options_.after_noted();
     }
@@ -137,16 +162,28 @@ void PadRefresher::ThreadMain() {
       continue;
     }
     int64_t begin = NowUs();
-    const auto t0 = std::chrono::steady_clock::now();
+    const int64_t t0 = SteadyUs();
     options_.refresh();
-    const int64_t took_us = std::chrono::duration_cast<std::chrono::microseconds>(
-                                std::chrono::steady_clock::now() - t0)
-                                .count();
+    const int64_t t1 = SteadyUs();
     int64_t end = NowUs();
-    // Waits come back after a round that took less than half the limit that
-    // a caller gave up on.
+    const int64_t took_us = t1 - t0;
+    // Round costs. This thread is their only writer.
+    if (took_us > longest_round_us_.load(std::memory_order_relaxed)) {
+      longest_round_us_.store(took_us, std::memory_order_release);
+    }
+    round_us_sum_.store(round_us_sum_.load(std::memory_order_relaxed) + took_us,
+                        std::memory_order_release);
+    const int64_t start_delay_us = t0 - asked_us;
+    if (start_delay_us > longest_start_delay_us_.load(std::memory_order_relaxed)) {
+      longest_start_delay_us_.store(start_delay_us, std::memory_order_release);
+    }
+    // Waits come back after a round that ended less than half the limit a
+    // caller gave up on after the request of a skipped call it served: what
+    // a caller waits, not the refresh call's own time (a round that starts
+    // late is quick by its own clock). No such request yet (the stamp is 0,
+    // or from an earlier slow spell): not quick.
     if (slow_.load(std::memory_order_acquire) &&
-        took_us * 2 < slow_limit_us_.load(std::memory_order_acquire)) {
+        (t1 - asked_slow_us) * 2 < slow_limit_us_.load(std::memory_order_acquire)) {
       slow_.store(false, std::memory_order_release);
     }
     last_begin_us_.store(begin);
@@ -168,14 +205,21 @@ void PadRefresher::Stop() {
 }
 
 PadRefresher::Counts PadRefresher::counts() const {
-  Counts c;
+  Counts c{};
   c.rounds = rounds_.load(std::memory_order_acquire);
   c.fresh = fresh_.load(std::memory_order_acquire);
   c.recent = recent_.load(std::memory_order_acquire);
   c.timed_out = timed_out_.load(std::memory_order_acquire);
   c.skipped = skipped_.load(std::memory_order_acquire);
   c.stopped = stopped_count_.load(std::memory_order_acquire);
+  c.longest_round_us = longest_round_us_.load(std::memory_order_acquire);
+  c.round_us_sum = round_us_sum_.load(std::memory_order_acquire);
+  c.longest_start_delay_us = longest_start_delay_us_.load(std::memory_order_acquire);
   return c;
+}
+
+int64_t PadRefresher::longest_round_us() const {
+  return longest_round_us_.load(std::memory_order_acquire);
 }
 
 int64_t PadRefresher::last_round_begin_us() const {

@@ -318,6 +318,39 @@ void WaitersLeaveWhenOneTimesOut() {
   Release(fake, r);
 }
 
+// A caller that reaches its deadline looks at its round once more before it times out (review F5).
+// The at_deadline hook stands for a reader that lost its core between its last look and its clock
+// read: the held round is let go there, and the hook returns once the round's end is published (the
+// thread's next look sees the round ended, and it comes after done_ is stored). Without that look
+// the call times out on a round that has ended, and the next call is skipped.
+void RoundEndingAtTheDeadlineIsFresh() {
+  g_test = "RoundEndingAtTheDeadlineIsFresh";
+  Fake fake;
+  fake.hold_round = 1;
+  std::atomic<bool> published{false};
+  std::atomic<bool> hook_saw_it{false};
+  std::atomic<int> deadlines{0};
+  PadRefresher::Options o = fake.Options();
+  o.after_noted = [&] {
+    if (fake.ended.load() >= 1) published = true;
+  };
+  o.at_deadline = [&] {
+    if (deadlines.fetch_add(1) != 0) return;
+    fake.gate_open = true;
+    hook_saw_it = WaitUntil([&] { return published.load(); });
+  };
+  PadRefresher r(std::move(o));
+  Result at_deadline = r.RefreshAndWait(milliseconds(50));
+  fake.clock += 2000;
+  Result next = r.RefreshAndWait(kPlain);
+  CHECK(hook_saw_it && deadlines == 1);
+  CHECK(at_deadline == Result::kFresh);  // NOT kTimedOut
+  CHECK(r.counts().timed_out == 0);
+  CHECK(r.counts().fresh == 2);          // the second look counts its answer too
+  CHECK(next == Result::kFresh);         // NOT kSkipped: rounds were not marked slow
+  Release(fake, r);
+}
+
 // Rounds that are slow every time (100 ms each, limit 40 ms): one call pays the limit, the calls
 // after it do not wait but still ask for a round, so the state keeps being refreshed; when
 // rounds are quick again the waits come back. (Spec: "a stuck round costs 2 ms once, not every
@@ -352,6 +385,79 @@ void SlowRoundsCostOneLimit() {
   CHECK(still_off == Result::kSkipped);
   CHECK(back_on == Result::kFresh);
   CHECK(r.counts().rounds == 11);
+  Release(fake, r);
+
+  // The factor one half, from both sides (review F6). Limit 200 ms. A round that ends 150 ms after
+  // the skipped call's request (more than half the limit, less than the limit): the next call still
+  // does not wait. A round that ends about 60 ms after it (less than half; a coarse timer adds up to
+  // 16 ms): the next call waits again. A factor of 1 or more (the limit itself, twice it) fails the
+  // first leg, one of 1/4 or less the second; factors in between are not told apart here.
+  Fake fake2;
+  fake2.round_ms = 250;
+  PadRefresher r2(fake2.Options());
+  Result over = r2.RefreshAndWait(milliseconds(200));  // times out: rounds are slow, limit 200 ms
+  bool one = WaitUntil([&] { return r2.counts().rounds >= 1; });
+  fake2.round_ms = 150;
+  fake2.clock += 2000;
+  Result asks_150 = r2.RefreshAndWait(milliseconds(200));  // skipped; asks for a 150 ms round
+  bool two = WaitUntil([&] { return r2.counts().rounds >= 2; });
+  fake2.round_ms = 60;
+  fake2.clock += 2000;
+  Result after_150 = r2.RefreshAndWait(milliseconds(200));  // asks for a 60 ms round
+  bool three = WaitUntil([&] { return r2.counts().rounds >= 3; });
+  fake2.clock += 2000;
+  Result after_60 = r2.RefreshAndWait(milliseconds(200));
+  CHECK(over == Result::kTimedOut && asks_150 == Result::kSkipped);
+  CHECK(one && two && three);
+  CHECK(after_150 == Result::kSkipped);  // NOT kFresh (a factor of 1 or more)
+  CHECK(after_60 == Result::kFresh);     // NOT kSkipped (a factor of 1/4 or less)
+  CHECK(r2.counts().timed_out == 1);
+  Release(fake2, r2);
+}
+
+// Rounds that START late (review F1, its probe D): the refresher's thread is held 5 ms after each
+// look at the request count, so no round can end within a read's 2 ms limit, though the round
+// itself takes nothing. Judged by the refresh call's own duration such a round "was quick", so the
+// next frame's first read waited the limit again: 44 timeouts in 60 frames on that class (review6
+// run 2). Judged by the time from a skipped call's request to the round's end, one read pays the
+// limit once. Then the delay goes and the waits come back. Real clock: frames are real time apart.
+void LateStartedRoundsCostOneLimit() {
+  g_test = "LateStartedRoundsCostOneLimit";
+  Fake fake;
+  std::atomic<bool> late{true};
+  PadRefresher::Options o = fake.Options();
+  o.now_us = nullptr;
+  o.after_noted = [&] {
+    if (late.load()) std::this_thread::sleep_for(milliseconds(5));
+  };
+  PadRefresher r(std::move(o));
+  int fresh_late = 0;
+  for (int frame = 0; frame < 30; ++frame) {
+    for (int read = 0; read < 4; ++read) {
+      if (r.RefreshAndWait(milliseconds(2)) == Result::kFresh) ++fresh_late;
+    }
+    std::this_thread::sleep_for(milliseconds(14));
+  }
+  PadRefresher::Counts during = r.counts();
+  late = false;
+  int fresh_after = 0;
+  for (int frame = 0; frame < 15; ++frame) {
+    for (int read = 0; read < 4; ++read) {
+      if (r.RefreshAndWait(milliseconds(2)) == Result::kFresh) ++fresh_after;
+    }
+    std::this_thread::sleep_for(milliseconds(14));
+  }
+  PadRefresher::Counts after = r.counts();
+  std::printf("note LateStartedRoundsCostOneLimit: late: timed out %llu, skipped %llu, fresh %d; "
+              "after: timed out %llu, fresh %d\n",
+              static_cast<unsigned long long>(during.timed_out),
+              static_cast<unsigned long long>(during.skipped), fresh_late,
+              static_cast<unsigned long long>(after.timed_out), fresh_after);
+  CHECK(during.timed_out == 1);  // NOT one a frame or so
+  CHECK(fresh_late == 0);
+  CHECK(during.skipped >= 29);   // every later frame still asked for a round
+  CHECK(after.timed_out == 1);
+  CHECK(fresh_after >= 10);      // waits came back once rounds started on time
   Release(fake, r);
 }
 
@@ -402,6 +508,62 @@ void StopJoins() {
   std::this_thread::sleep_for(milliseconds(50));
   CHECK(begun == 1 && ended == 1 && fake.begun == 1 && fake.ended == 1 && !fake.inside);
   Release(fake, r);
+}
+
+// Stop() while the refresher's thread is between its look ("nothing to do") and its sleep (review
+// F7, its probe A): Stop() has not returned while the thread is held there, and returns once it is
+// let go (the thread sees the stop instead of sleeping through it).
+void StopBetweenLookAndSleep() {
+  g_test = "StopBetweenLookAndSleep";
+  Fake fake;
+  std::atomic<int> looks{0};
+  std::atomic<bool> at_hook{false};
+  std::atomic<bool> go{false};
+  std::atomic<bool> hook_gave_up{false};
+  PadRefresher::Options o = fake.Options();
+  o.after_noted = [&] {
+    if (looks.fetch_add(1) != 0) return;
+    at_hook = true;
+    if (!WaitUntil([&] { return go.load(); }, 30000)) hook_gave_up = true;
+  };
+  PadRefresher r(std::move(o));
+  CHECK(WaitUntil([&] { return at_hook.load(); }));
+  std::atomic<bool> stop_entered{false};
+  std::future<void> s = std::async(std::launch::async, [&] {
+    stop_entered = true;
+    r.Stop();
+  });
+  CHECK(WaitUntil([&] { return stop_entered.load(); }));
+  CHECK(!AtOnce(s, 200));  // the join waits for the held thread
+  go = true;
+  CHECK(AtOnce(s));
+  CHECK(!hook_gave_up && fake.begun == 0);
+  Release(fake, r);
+}
+
+// Refreshers destroyed at once (the thread may not have reached its first look) and after one
+// call (review F7, its probe B): every destructor returns, every call is fresh.
+void ConstructDestroy() {
+  g_test = "ConstructDestroy";
+  std::future<int> whole = std::async(std::launch::async, [] {
+    int not_fresh = 0;
+    for (int i = 0; i < 1000; ++i) {
+      PadRefresher::Options o;
+      o.refresh = [] {};
+      PadRefresher r(std::move(o));
+    }
+    for (int i = 0; i < 1000; ++i) {
+      PadRefresher::Options o;
+      o.refresh = [] {};
+      PadRefresher r(std::move(o));
+      if (r.RefreshAndWait(seconds(2)) != Result::kFresh) ++not_fresh;
+    }
+    return not_fresh;
+  });
+  bool ready = AtOnce(whole, 30000);
+  int not_fresh = ready ? whole.get() : -1;
+  CHECK(ready);
+  CHECK(not_fresh == 0);
 }
 
 // The clock does not move after the round, so a call after Stop() would be "recent" if the
@@ -505,6 +667,53 @@ void CountsMatch() {
   CHECK(c.timed_out == 1);
   CHECK(c.skipped == 2);
   CHECK(c.stopped == 1);
+  Release(fake, r);
+}
+
+// What rounds cost (review F2), one check or more for each statement that writes a cost: each
+// starts at 0 (looked at while the thread is held before its first round); the longest round is the
+// longest, not the last (100 ms, then 30 ms); the sum adds every round (130 ms or more, which the
+// longest alone is not); the start delay runs from the request to the round's start, not to its end
+// (the thread is held 25 ms after round 1's request, and round 1 takes 100 ms, so to its end would
+// be 125 ms or more), and is the longest, not the last (round 2 starts at once); a request time
+// that was never stored would make it the clock's whole count since the PC started.
+void RoundCostsAreCounted() {
+  g_test = "RoundCostsAreCounted";
+  Fake fake;
+  std::atomic<int> looks{0};
+  std::atomic<bool> at_hook{false};
+  std::atomic<bool> requested{false};
+  std::atomic<bool> hook_gave_up{false};
+  PadRefresher::Options o = fake.Options();
+  o.after_noted = [&] {
+    if (looks.fetch_add(1) != 0) return;  // the first look only (it found nothing to do)
+    at_hook = true;
+    if (!WaitUntil([&] { return requested.load(); }, 30000)) hook_gave_up = true;
+    std::this_thread::sleep_for(milliseconds(25));
+  };
+  o.after_request = [&] { requested = true; };
+  PadRefresher r(std::move(o));
+  bool held = WaitUntil([&] { return at_hook.load(); });
+  PadRefresher::Counts before = r.counts();
+  int64_t longest_before = r.longest_round_us();
+  fake.round_ms = 100;
+  Result first = r.RefreshAndWait(kPlain);
+  fake.round_ms = 30;
+  fake.clock += 2000;
+  Result second = r.RefreshAndWait(kPlain);
+  PadRefresher::Counts c = r.counts();
+  std::printf("note RoundCostsAreCounted: longest round %lld us, sum %lld us, longest start delay %lld us\n",
+              static_cast<long long>(c.longest_round_us), static_cast<long long>(c.round_us_sum),
+              static_cast<long long>(c.longest_start_delay_us));
+  CHECK(held && first == Result::kFresh && second == Result::kFresh && c.rounds == 2);
+  CHECK(before.longest_round_us == 0 && before.round_us_sum == 0 &&
+        before.longest_start_delay_us == 0 && longest_before == 0);
+  CHECK(c.longest_round_us >= 100000);   // NOT the last round's (30 ms)
+  CHECK(r.longest_round_us() == c.longest_round_us);
+  CHECK(c.round_us_sum >= 130000);       // NOT the longest alone
+  CHECK(c.longest_start_delay_us >= 25000);   // NOT the last round's (it started at once)
+  CHECK(c.longest_start_delay_us < 100000);   // NOT to the round's end
+  CHECK(!hook_gave_up);
   Release(fake, r);
 }
 
@@ -752,13 +961,18 @@ int main() {
   RoundStartsAfterRequest();
   StuckRound();
   WaitersLeaveWhenOneTimesOut();
+  RoundEndingAtTheDeadlineIsFresh();
   SlowRoundsCostOneLimit();
+  LateStartedRoundsCostOneLimit();
   StopReleasesWaiter();
   StopJoins();
+  StopBetweenLookAndSleep();
+  ConstructDestroy();
   AfterStopReturnsAtOnce();
   NotStartedReturnsAtOnce();
   DefaultClockStampsRounds();
   CountsMatch();
+  RoundCostsAreCounted();
   SpinKeepsTheCore();
   YieldsAfterTheSpin();
   NoSpinYieldsAtOnce();
@@ -771,6 +985,7 @@ int main() {
   } else {
     std::printf("pad_refresher: all checks passed\n");
   }
-  std::printf("%d checks, %d failures\n", g_checks, g_failures);
+  // The SDK host suite's judge reads this last line (its default shape).
+  std::printf("%s: %d checks, %d failures\n", g_failures ? "FAILED" : "PASSED", g_checks, g_failures);
   return g_failures ? 1 : 0;
 }
