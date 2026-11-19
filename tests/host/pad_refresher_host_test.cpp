@@ -952,8 +952,8 @@ void StuckCallerBlocksNobody() {
 
 // The closing line's round cost and its WARN (review 7 R3): a pure function of the counts, so
 // the driver's one comparison is pinned here. The limits are written as literals (1000 rounds,
-// 500 us), not taken from the constants under test. Each fixture's longest round differs from
-// its mean and its sum, so a function that judged either of those gives another answer.
+// 500 us), not taken from the constants under test. In each fixture with rounds the longest
+// round differs from the mean and the sum, so a function that judged it gives another answer.
 void RoundCostSummary() {
   g_test = "RoundCostSummary";
   auto of = [](uint64_t rounds, int64_t sum_us, int64_t longest_us) {
